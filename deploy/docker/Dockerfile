@@ -50,7 +50,7 @@ RUN cargo build --release --locked
 # the runtime stage is distroless — no shell, so no `RUN mkdir` there — and an
 # empty directory cannot be COPY'd from the build context either (git does not
 # track empty directories). See the runtime stage for why it must pre-exist.
-RUN mkdir -p /state
+RUN mkdir -p /state && chmod 750 /state
 
 # ---------- stage: runtime ----------
 # Distroless: glibc + CA certs and nothing else — no shell, no package manager,
@@ -80,7 +80,7 @@ COPY --from=builder /app/target/release/spark-dashboard /usr/local/bin/spark-das
 # image lacks it — unwritable for uid 65532, with no shell here to chown it
 # after the fact. See docker.md, "Saved dashboards". Numeric uid:gid so the copy
 # does not depend on the base image's /etc/passwd.
-COPY --from=builder --chown=65532:65532 --chmod=750 /state /var/lib/spark-dashboard
+COPY --from=builder --chown=65532:65532 /state /var/lib/spark-dashboard
 
 # Already uid 65532 via the :nonroot tag; stated explicitly for clarity. NVML,
 # /proc, and the docker socket all work non-root given the device/group access
