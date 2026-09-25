@@ -23,6 +23,7 @@
  */
 
 import { pageSlug } from './routes'
+import type { HardwareSource } from './hardwareSource'
 import type { PageSource } from './pageSource'
 import type { DashboardDocument, DashboardPage } from './schema'
 
@@ -116,6 +117,41 @@ function sameSource(a: PageSource | undefined, b: PageSource | undefined): boole
   if (a === undefined || b === undefined) return a === b
   if (a.kind !== b.kind) return false
   return a.kind !== 'engine' || b.kind !== 'engine' || a.endpoint === b.endpoint
+}
+
+/**
+ * The document with one page's hardware source replaced — which machine's
+ * hardware its hardware panels read, or (with `null`) back to this machine.
+ *
+ * A page edit like the source and the name, written when it is made. Null
+ * **removes** the field rather than storing a sentinel, because absent is
+ * what "this machine" looks like everywhere else in the document.
+ */
+export function setPageHardware(
+  document: DashboardDocument,
+  pageId: string,
+  hardware: HardwareSource | null,
+): DashboardDocument {
+  const page = document.pages.find((candidate) => candidate.id === pageId)
+  if (!page || sameHardware(page.hardware, hardware ?? undefined)) return document
+
+  return {
+    ...document,
+    pages: document.pages.map((candidate) => {
+      if (candidate.id !== pageId) return candidate
+      if (hardware === null) {
+        const cleared = { ...candidate }
+        delete cleared.hardware
+        return cleared
+      }
+      return { ...candidate, hardware }
+    }),
+  }
+}
+
+function sameHardware(a: HardwareSource | undefined, b: HardwareSource | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b
+  return a.url === b.url
 }
 
 /** What became of a request to delete a page. */

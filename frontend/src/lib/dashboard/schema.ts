@@ -22,6 +22,7 @@
 
 import { readBinding, type PanelBinding } from './bindings'
 import { readGeometry, type PanelGeometry } from './grid'
+import { readHardwareSource, type HardwareSource } from './hardwareSource'
 import { isRecord } from './json'
 import { readPageSource, type PageSource } from './pageSource'
 import { defaultPanelTitle } from './panels'
@@ -38,8 +39,9 @@ import { TIME_WINDOW_SECONDS, type TimeWindow } from '@/types/events'
  * is what makes rolling the dashboard back recoverable.
  *
  * - v2 added the optional per-page `source` (`lib/dashboard/pageSource`).
+ * - v3 added the optional per-page `hardware` (`lib/dashboard/hardwareSource`).
  */
-export const DASHBOARD_SCHEMA_VERSION = 2
+export const DASHBOARD_SCHEMA_VERSION = 3
 
 /** Time window a panel's chart covers when the operator has not chosen one. */
 export const DEFAULT_TIME_WINDOW: TimeWindow = '5m'
@@ -63,6 +65,11 @@ export interface DashboardPage {
    * the host's own default — which is where every page starts.
    */
   source?: PageSource
+  /**
+   * Which machine's hardware the page's hardware panels read. Absent means
+   * this machine — where every page starts; only the remote case is stored.
+   */
+  hardware?: HardwareSource
   panels: DashboardPanel[]
 }
 
@@ -128,6 +135,9 @@ export function serializeDashboardDocument(document: DashboardDocument): string 
                 ? { kind: 'engine', endpoint: page.source.endpoint }
                 : { kind: 'all' },
           }),
+      // Written in its only storable form (`{ kind: 'remote', url }`) for the
+      // same reason as `source` above.
+      ...(page.hardware === undefined ? {} : { hardware: { ...page.hardware } }),
       panels: page.panels.map((panel) => ({
         id: panel.id,
         type: panel.type,
@@ -155,11 +165,13 @@ export function panelTitle(panel: Pick<DashboardPanel, 'type' | 'title'>): strin
 function readPage(raw: Record<string, unknown>): DashboardPage {
   const panels = Array.isArray(raw.panels) ? raw.panels.filter(isRecord).map(readPanel) : []
   const source = readPageSource(raw.source)
+  const hardware = readHardwareSource(raw.hardware)
 
   return {
     id: readId(raw.id),
     name: readText(raw.name) ?? '',
     ...(source === undefined ? {} : { source }),
+    ...(hardware === undefined ? {} : { hardware }),
     panels: withUniqueIds(panels, 'panel'),
   }
 }

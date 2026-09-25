@@ -66,6 +66,39 @@ const MIGRATION_FIXTURES: MigrationFixture[] = [
       expect(document.pages[0].panels[1].binding).toEqual({ kind: 'gpu', index: 1 })
     },
   },
+  {
+    name: 'a v2 document, from before the per-page hardware source',
+    // As the v2 build's serializer actually wrote it: a page that does have
+    // an engine source — which is what v2 arrived for — but no `hardware`.
+    stored: {
+      version: 2,
+      pages: [
+        {
+          id: 'dgx',
+          name: 'DGX',
+          source: { kind: 'engine', endpoint: 'http://127.0.0.1:8000' },
+          panels: [
+            {
+              id: 'cpu',
+              type: 'cpu-utilization',
+              geometry: { x: 0, y: 0, w: 6, h: 3 },
+              window: '1h',
+            },
+          ],
+        },
+      ],
+    },
+    from: 2,
+    expect: (document) => {
+      // The addition was the optional hardware source, so a v2 page comes
+      // through whole and without one — absent is this machine, which is what
+      // it was reading, and its engine source is carried along untouched.
+      expect(document.pages).toHaveLength(1)
+      expect(document.pages[0].hardware).toBeUndefined()
+      expect(document.pages[0].source).toEqual({ kind: 'engine', endpoint: 'http://127.0.0.1:8000' })
+      expect(document.pages[0].panels.map((panel) => panel.id)).toEqual(['cpu'])
+    },
+  },
 ]
 
 /** A stand-in migration, so the runner's chaining is covered before there is a real one. */

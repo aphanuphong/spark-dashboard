@@ -42,12 +42,22 @@ export interface MigrationPath {
 }
 
 /**
- * v1 → v2: the per-page `source` arrived. Additive — an absent source means
- * automatic, which is exactly what every v1 page was — so nothing is rewritten;
- * the runner stamps the version.
+ * - v1 → v2: the per-page `source` arrived. Additive — an absent source means
+ *   automatic, which is exactly what every v1 page was — so nothing is rewritten;
+ *   the runner stamps the version.
  */
 const addPageSource: DashboardMigration = {
   from: 1,
+  migrate: (document) => ({ ...document }),
+}
+
+/**
+ * v2 → v3: the per-page `hardware` source arrived (`lib/dashboard/hardwareSource`).
+ * Additive again — an absent field means this machine, exactly what every v2
+ * page showed — so the step is another walk over the version, not the data.
+ */
+const addPageHardwareSource: DashboardMigration = {
+  from: 2,
   migrate: (document) => ({ ...document }),
 }
 
@@ -58,7 +68,7 @@ const addPageSource: DashboardMigration = {
  * `DASHBOARD_SCHEMA_VERSION`, and adding a fixture to `migrations.test.ts`.
  */
 export const DASHBOARD_MIGRATION_PATH: MigrationPath = {
-  migrations: [addPageSource],
+  migrations: [addPageSource, addPageHardwareSource],
   target: DASHBOARD_SCHEMA_VERSION,
 }
 

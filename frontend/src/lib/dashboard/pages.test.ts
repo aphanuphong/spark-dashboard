@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { addPage, removePage, renamePage, setPageSource } from './pages'
+import { addPage, removePage, renamePage, setPageHardware, setPageSource } from './pages'
 import { ALL_MODELS } from './pageSource'
 import { DASHBOARD_SCHEMA_VERSION, type DashboardDocument, type DashboardPage } from './schema'
 
@@ -10,6 +10,7 @@ function documentOf(...pages: Array<Partial<DashboardPage>>): DashboardDocument 
       id: page.id ?? `page-${index + 1}`,
       name: page.name ?? `Page ${index + 1}`,
       ...(page.source === undefined ? {} : { source: page.source }),
+      ...(page.hardware === undefined ? {} : { hardware: page.hardware }),
       panels: page.panels ?? [],
     })),
   }
@@ -145,6 +146,57 @@ describe('setPageSource', () => {
     const next = setPageSource(document, 'p', ALL_MODELS)
 
     expect(next.pages[1]).toBe(document.pages[1])
+  })
+})
+
+describe('setPageHardware', () => {
+  it('stores a remote source on the named page and only there', () => {
+    const next = setPageHardware(
+      documentOf({ id: 'local' }, { id: 'peer' }),
+      'peer',
+      { kind: 'remote', url: 'http://dgx1.rt-ctrl.com:3000' },
+    )
+
+    expect(next.pages[0].hardware).toBeUndefined()
+    expect(next.pages[1].hardware).toEqual({ kind: 'remote', url: 'http://dgx1.rt-ctrl.com:3000' })
+  })
+
+  it('removes the field on the way back to this machine, rather than storing a sentinel', () => {
+    const configured = documentOf({
+      id: 'p',
+      hardware: { kind: 'remote', url: 'http://dgx1.rt-ctrl.com:3000' },
+    })
+    const next = setPageHardware(configured, 'p', null)
+
+    expect(next.pages[0]).not.toHaveProperty('hardware')
+  })
+
+  it('returns the same document when nothing would change', () => {
+    const document = documentOf({ id: 'p', hardware: { kind: 'remote', url: 'u' } }, { id: 'q' })
+
+    expect(setPageHardware(document, 'p', { kind: 'remote', url: 'u' })).toBe(document)
+    expect(setPageHardware(document, 'q', null)).toBe(document)
+    expect(setPageHardware(document, 'gone', { kind: 'remote', url: 'u' })).toBe(document)
+  })
+
+  it('keeps the untouched pages by identity and replaces only the page named', () => {
+    const document = documentOf({ id: 'p' }, { id: 'q', source: ALL_MODELS })
+    const next = setPageHardware(document, 'p', { kind: 'remote', url: 'u' })
+
+    expect(next.pages[1]).toBe(document.pages[1])
+    expect(next.pages[0].source).toBeUndefined()
+  })
+
+  it('leaves the engine source alone: two axes, written one at a time', () => {
+    const configured = documentOf({
+      id: 'p',
+      source: ALL_MODELS,
+      hardware: { kind: 'remote', url: 'http://dgx1:3000' },
+    })
+    const next = setPageHardware(configured, 'p', null)
+
+    expect(next.pages[0].source).toEqual(ALL_MODELS)
+    expect(next.pages[0].hardware).toBeUndefined()
   })
 })
 
