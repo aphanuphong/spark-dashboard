@@ -1,9 +1,9 @@
 import { useElementSize } from '@/hooks/useElementSize'
-import { useLatestSnapshot } from '@/hooks/useMetricsStore'
 import { coreUsageColor } from '@/lib/theme'
 import { usePanelDevice } from '../panelDevice'
 import { coreGridLayout } from './mode'
-import { PanelNotice } from './PanelNotice'
+import { PanelNotice, HardwarePanelNotice } from './PanelNotice'
+import { hardwareDevice, useHardwarePanel } from './useHardwarePanel'
 import type { CoreMetrics } from '@/types/metrics'
 
 /**
@@ -19,12 +19,16 @@ import type { CoreMetrics } from '@/types/metrics'
  * engine, on the same terms as the gauge panels' modes.
  */
 export function CpuCoresPanel() {
-  const snapshot = useLatestSnapshot()
+  const resolution = useHardwarePanel()
   const [ref, size] = useElementSize<HTMLUListElement>()
+  const snapshot = resolution.status === 'resolved' ? resolution.snapshot : null
   const cores = snapshot?.cpu.per_core ?? []
   const { columns, labelled } = coreGridLayout(size, cores.length)
-  usePanelDevice(snapshot?.cpu.name)
+  usePanelDevice(hardwareDevice(snapshot?.cpu.name, resolution))
 
+  if (resolution.status === 'peer-not-mirrored' || resolution.status === 'peer-down') {
+    return <HardwarePanelNotice resolution={resolution} />
+  }
   if (!snapshot) return <PanelNotice>Waiting for metrics</PanelNotice>
   if (cores.length === 0) return <PanelNotice>This host reports no per-core load.</PanelNotice>
 

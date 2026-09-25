@@ -8,6 +8,7 @@ import { gpuLabel } from './gpuLabel'
 import { GpuPanelNotice, PanelNotice } from './PanelNotice'
 import { HardwarePanelBody } from './HardwarePanelBody'
 import { useGpuPanelSeries } from './useGpuPanel'
+import { hardwareDeviceForGpu } from './useHardwarePanel'
 import type { PanelContentProps } from '../panelRegistry'
 
 /**
@@ -49,7 +50,7 @@ export function GpuMemoryPanel({ panel }: PanelContentProps) {
 
   return (
     <HardwarePanelBody
-      device={gpu.name}
+      device={hardwareDeviceForGpu(gpu.name, resolution)}
       compact={<HBar label={label} unit="%" segments={segments} />}
       gauge={(sizePx) => <ArcGauge label={label} unit="%" segments={segments} size={sizePx} />}
       chart={<TimeSeriesChart data={data} yDomain={[0, 100]} unit="%" seriesLabel="VRAM" />}

@@ -5,6 +5,7 @@ import { gpuLabel } from './gpuLabel'
 import { GpuPanelNotice } from './PanelNotice'
 import { HardwarePanelBody } from './HardwarePanelBody'
 import { useGpuPanelSeries } from './useGpuPanel'
+import { hardwareDeviceForGpu } from './useHardwarePanel'
 import type { PanelContentProps } from '../panelRegistry'
 
 /** One GPU's utilization: gauge plus trend over the panel's own window. */
@@ -17,7 +18,7 @@ export function GpuUtilizationPanel({ panel }: PanelContentProps) {
 
   return (
     <HardwarePanelBody
-      device={resolution.gpu.name}
+      device={hardwareDeviceForGpu(resolution.gpu.name, resolution)}
       compact={<HBar value={value} label={label} unit="%" />}
       gauge={(sizePx) => <ArcGauge value={value} label={label} unit="%" size={sizePx} />}
       chart={

@@ -6,6 +6,7 @@ import { gpuLabel } from './gpuLabel'
 import { GpuPanelNotice } from './PanelNotice'
 import { HardwarePanelBody } from './HardwarePanelBody'
 import { useGpuPanelSeries } from './useGpuPanel'
+import { hardwareDeviceForGpu } from './useHardwarePanel'
 import type { PanelContentProps } from '../panelRegistry'
 
 /** One GPU's temperature, colored by the product's thermal thresholds. */
@@ -18,7 +19,7 @@ export function GpuTemperaturePanel({ panel }: PanelContentProps) {
 
   return (
     <HardwarePanelBody
-      device={resolution.gpu.name}
+      device={hardwareDeviceForGpu(resolution.gpu.name, resolution)}
       compact={<HBar value={value} label={label} unit="°C" thresholds={THRESHOLDS.gpuTemp} />}
       gauge={(sizePx) => (
         <ArcGauge value={value} label={label} unit="°C" thresholds={THRESHOLDS.gpuTemp} size={sizePx} />

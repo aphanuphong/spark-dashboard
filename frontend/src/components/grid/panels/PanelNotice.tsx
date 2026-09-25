@@ -2,6 +2,7 @@ import type { ReactNode } from 'react'
 import { engineDescription } from '@/lib/format'
 import type { EnginePanelNoticeState } from './useEnginePanel'
 import type { GpuPanelResolution } from './useGpuPanel'
+import type { HardwarePanelResolution } from './useHardwarePanel'
 
 /**
  * A panel's stand-in content when there is nothing to render yet — the same
@@ -61,5 +62,33 @@ export function GpuPanelNotice({
       return <PanelNotice>No GPU on this host.</PanelNotice>
     case 'unreadable':
       return <PanelNotice>This panel’s pinned GPU could not be read — repoint it.</PanelNotice>
+    case 'peer-not-mirrored':
+      return <HardwarePanelNotice resolution={{ status: 'peer-not-mirrored', url: resolution.url }} />
+    case 'peer-down':
+      return <HardwarePanelNotice resolution={{ status: 'peer-down', url: resolution.url }} />
+  }
+}
+
+/**
+ * What a hardware panel says when the page's machine is not readable. The
+ * prohibition on substitution applies here exactly as it does to engine and
+ * GPU bindings: this box's numbers never stand in for the peer's, because the
+ * page asked for another machine and got a reason instead.
+ */
+export function HardwarePanelNotice({
+  resolution,
+}: {
+  resolution: Exclude<HardwarePanelResolution, { status: 'resolved' } | { status: 'waiting' }>
+}) {
+  switch (resolution.status) {
+    case 'peer-not-mirrored':
+      return (
+        <PanelNotice>
+          {resolution.url} is not mirrored by this dashboard — repoint the page or add it to
+          the remote hosts.
+        </PanelNotice>
+      )
+    case 'peer-down':
+      return <PanelNotice>{resolution.url} is connected here but reporting nothing.</PanelNotice>
   }
 }

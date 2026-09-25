@@ -5,6 +5,7 @@ import { gpuLabel } from './gpuLabel'
 import { GpuPanelNotice, PanelNotice } from './PanelNotice'
 import { HardwarePanelBody } from './HardwarePanelBody'
 import { useGpuPanelSeries } from './useGpuPanel'
+import { hardwareDeviceForGpu } from './useHardwarePanel'
 import type { PanelContentProps } from '../panelRegistry'
 
 /**
@@ -31,7 +32,7 @@ export function GpuFanPanel({ panel }: PanelContentProps) {
 
   return (
     <HardwarePanelBody
-      device={gpu.name}
+      device={hardwareDeviceForGpu(gpu.name, resolution)}
       compact={<HBar value={percent} label={label} unit="%" />}
       gauge={(sizePx) => <ArcGauge value={percent} label={label} unit="%" size={sizePx} />}
       chart={<TimeSeriesChart data={data} yDomain={[0, 100]} unit="%" seriesLabel="Fan" />}

@@ -7,6 +7,7 @@ import { gpuLabel } from './gpuLabel'
 import { GpuPanelNotice } from './PanelNotice'
 import { HardwarePanelBody } from './HardwarePanelBody'
 import { useGpuPanelSeries } from './useGpuPanel'
+import { hardwareDeviceForGpu } from './useHardwarePanel'
 import type { PanelContentProps } from '../panelRegistry'
 
 /**
@@ -29,7 +30,7 @@ export function GpuPowerPanel({ panel }: PanelContentProps) {
 
   return (
     <HardwarePanelBody
-      device={resolution.gpu.name}
+      device={hardwareDeviceForGpu(resolution.gpu.name, resolution)}
       compact={
         <HBar
           value={percent}

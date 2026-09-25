@@ -1,4 +1,4 @@
-import { useGpuEvents, useLatestSnapshot } from '@/hooks/useMetricsStore'
+import { useGpuEvents } from '@/hooks/useMetricsStore'
 import { formatAge } from '@/lib/format'
 import { gpuIndexOf } from '@/lib/identity'
 import { gpuEventColor } from '@/lib/theme'
@@ -20,8 +20,10 @@ import type { PanelContentProps } from '../panelRegistry'
  */
 export function GpuEventsPanel({ panel }: PanelContentProps) {
   const resolution = useGpuPanel(panel)
-  const events = useGpuEvents(panel.window)
-  const snapshot = useLatestSnapshot()
+  // The machine this GPU's events come from — this host's buffer unless the
+  // page points at a mirrored peer.
+  const events = useGpuEvents(panel.window, resolution.status === 'resolved' ? resolution.peer?.url : undefined)
+  const snapshot = resolution.status === 'resolved' ? resolution.snapshot : null
   // Above the early return, like every hook here — a panel whose binding has
   // not resolved still has to call it, with nothing to report.
   usePanelDevice(resolution.status === 'resolved' ? resolution.gpu.name : null)
