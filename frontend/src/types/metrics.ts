@@ -8,6 +8,18 @@ export interface MetricsSnapshot {
   network: NetworkMetrics
   engines: EngineSnapshot[]
   gpu_events: GpuEventData[]
+  /** Hardware mirrored from peer dashboards (`--remote`); empty when none are
+   *  configured. Always present on backends that support remote mirroring. */
+  remote?: RemoteHostSnapshot[]
+}
+
+/** Wire-format peer snapshot matching the backend RemoteSnapshot struct. */
+export interface RemoteHostSnapshot {
+  url: string
+  label: string
+  connected: boolean
+  /** The peer's own MetricsSnapshot, forwarded verbatim; null while down. */
+  data: MetricsSnapshot | null
 }
 
 /** Wire-format GPU event matching backend GpuEvent struct */

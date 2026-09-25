@@ -28,6 +28,7 @@ describe('the panel type vocabulary', () => {
       'memory',
       'disk-io',
       'network-io',
+      'remote-hosts',
       'engines-overview',
       'engine-status',
       'engine-prefill-throughput',

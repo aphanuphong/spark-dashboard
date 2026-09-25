@@ -75,6 +75,10 @@ export const PANEL_TYPES = {
   memory: { binds: 'none', title: 'Memory' },
   'disk-io': { binds: 'none', title: 'Disk I/O' },
   'network-io': { binds: 'none', title: 'Network' },
+  // Peer hosts mirrored over their own dashboard socket — a view of the fleet
+  // rather than this host. Still host-wide in the binding sense: it has no
+  // single target to select, exactly like `engines-overview` is for engines.
+  'remote-hosts': { binds: 'none', title: 'Remote Hosts', windowed: false },
 
   // ── Engines ─────────────────────────────────────────────────────────────
   // The only engine panel that binds to nothing: it is about the host, not

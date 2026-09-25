@@ -40,6 +40,7 @@ import { InferenceTimelinePanel } from './panels/InferenceTimelinePanel'
 import { LogsPanel } from './panels/LogsPanel'
 import { MemoryPanel } from './panels/MemoryPanel'
 import { NetworkIoPanel } from './panels/NetworkIoPanel'
+import { RemoteHostsPanel } from './panels/RemoteHostsPanel'
 
 /** Every panel content component takes the panel it renders, nothing else —
  *  data comes from the metrics store, not from props threaded through the grid. */
@@ -60,6 +61,7 @@ const PANEL_CONTENT: Partial<Record<PanelType, ComponentType<PanelContentProps>>
   memory: MemoryPanel,
   'disk-io': DiskIoPanel,
   'network-io': NetworkIoPanel,
+  'remote-hosts': RemoteHostsPanel,
   'engine-prefill-throughput': EnginePrefillThroughputPanel,
   'engine-decode-throughput': EngineDecodeThroughputPanel,
   'engine-latency': EngineLatencyPanel,

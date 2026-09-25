@@ -6,6 +6,7 @@ pub mod memory;
 pub mod network;
 
 use crate::engines::EngineSnapshot;
+use crate::remote::RemoteState;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
@@ -25,6 +26,29 @@ pub struct MetricsSnapshot {
     pub network: NetworkMetrics,
     pub engines: Vec<EngineSnapshot>,
     pub gpu_events: Vec<gpu::GpuEvent>,
+    /// Hardware snapshots mirrored from peer spark-dashboard hosts over their
+    /// `/ws` stream (`--remote`). Empty when no remote hosts are configured.
+    /// Present (and empty) so frontends never need to special-case the field.
+    pub remote: Vec<RemoteSnapshot>,
+}
+
+/// A peer dashboard's latest broadcast, kept even when disconnected so the UI
+/// can distinguish "lost the peer" from "no such peer configured".
+#[derive(Clone, serde::Serialize, Debug)]
+pub struct RemoteSnapshot {
+    pub url: String,
+    pub label: String,
+    pub connected: bool,
+    /// Raw JSON of the peer's `MetricsSnapshot`, forwarded verbatim.
+    pub data: Option<serde_json::Value>,
+}
+
+/// Clone out every mirrored peer snapshot, sorted by URL so the array order
+/// is stable across ticks (the map is a HashMap).
+pub(crate) async fn remote_snapshots(state: &RemoteState) -> Vec<RemoteSnapshot> {
+    let mut entries: Vec<RemoteSnapshot> = state.read().await.values().cloned().collect();
+    entries.sort_by(|a, b| a.url.cmp(&b.url));
+    entries
 }
 
 /// Runs the metrics collection loop, broadcasting JSON snapshots to all subscribers.
@@ -39,6 +63,7 @@ pub async fn metrics_collector(
     gpu_index: Option<u32>,
     simulate_gpus: u32,
     engine_state: std::sync::Arc<tokio::sync::RwLock<Vec<EngineSnapshot>>>,
+    remote_state: crate::remote::RemoteState,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(poll_interval_ms));
 
@@ -159,6 +184,8 @@ pub async fn metrics_collector(
         ));
         let gpu = gpus.first().cloned().unwrap_or_else(gpu::empty_gpu_metrics);
 
+        let remote = remote_snapshots(&remote_state).await;
+
         let snapshot = MetricsSnapshot {
             timestamp_ms,
             gpu,
@@ -169,6 +196,7 @@ pub async fn metrics_collector(
             network: network::collect_network_metrics(&networks),
             engines,
             gpu_events,
+            remote,
         };
 
         match serde_json::to_string(&snapshot) {
@@ -191,6 +219,7 @@ pub async fn metrics_collector(
     _gpu_index: Option<u32>,
     simulate_gpus: u32,
     engine_state: std::sync::Arc<tokio::sync::RwLock<Vec<EngineSnapshot>>>,
+    remote_state: crate::remote::RemoteState,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(poll_interval_ms));
 
@@ -233,6 +262,8 @@ pub async fn metrics_collector(
         let gpu = gpu::collect_gpu_metrics();
         let mut gpus = vec![gpu.clone()];
         gpus.extend(gpu_sim::simulated_gpus(simulate_gpus, 1, timestamp_ms));
+        let remote = remote_snapshots(&remote_state).await;
+
         let snapshot = MetricsSnapshot {
             timestamp_ms,
             gpu,
@@ -243,6 +274,7 @@ pub async fn metrics_collector(
             network: network::collect_network_metrics(&networks),
             engines,
             gpu_events,
+            remote,
         };
 
         match serde_json::to_string(&snapshot) {

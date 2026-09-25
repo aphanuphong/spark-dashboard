@@ -5,6 +5,7 @@ mod config_store;
 mod deploy_files;
 mod engines;
 mod metrics;
+mod remote;
 mod server;
 mod ws;
 
@@ -14,6 +15,7 @@ mod logs;
 use clap::{Args, Parser, Subcommand};
 use cli::service::ServiceCommand;
 use engines::{ApiKeyResolver, EngineOverride, EngineType};
+use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -147,6 +149,18 @@ struct RunArgs {
     #[arg(long, env = "SPARK_DASHBOARD_PROVIDER_API_KEY")]
     provider_api_key: Option<String>,
 
+    /// Peer spark-dashboard URLs to mirror hardware metrics from, comma-
+    /// separated. Each peer's own `/ws` snapshot stream is grafted into this
+    /// host's snapshots under `remote[]`, so one dashboard shows several
+    /// machines. Example: `http://dgx1.rt-ctrl.com:3000,http://dgx2:3000`.
+    #[arg(
+        long,
+        value_name = "URL",
+        env = "SPARK_DASHBOARD_REMOTE",
+        value_delimiter = ','
+    )]
+    remote: Vec<String>,
+
     /// Enable the experimental log viewer at /ws/logs (Linux only).
     ///
     /// When set, the dashboard streams container logs from the Docker daemon
@@ -237,6 +251,30 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
     // Shared engine state: engine collector writes, metrics collector reads
     let engine_state: Arc<RwLock<Vec<engines::EngineSnapshot>>> = Arc::new(RwLock::new(Vec::new()));
 
+    // Peer dashboards whose hardware snapshots we mirror over WebSocket.
+    // An empty `remote_state` costs one map read per tick.
+    let remote_state: remote::RemoteState = Arc::new(RwLock::new(HashMap::new()));
+    let remote_targets: Vec<remote::RemoteTarget> = args
+        .remote
+        .iter()
+        .filter(|url| !url.trim().is_empty())
+        .map(|url| {
+            let trimmed = url.trim().trim_end_matches('/');
+            let label = trimmed
+                .split_once("://")
+                .map(|(_, rest)| rest.split([':', '/']).next().unwrap_or(trimmed).to_owned())
+                .unwrap_or_else(|| trimmed.to_owned());
+            remote::RemoteTarget {
+                url: trimmed.to_owned(),
+                label,
+            }
+        })
+        .collect();
+    if !remote_targets.is_empty() {
+        tracing::info!("Remote hardware mirroring: {:?}", remote_targets);
+        remote::spawn_mirrors(remote_targets, remote_state.clone());
+    }
+
     // Spawn engine collector loop as separate tokio task (Research Pitfall 7:
     // separate task so slow engine API calls don't block hardware metrics)
     tokio::spawn(engines::engine_collector_loop(
@@ -252,6 +290,7 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
         args.gpu_index,
         args.simulate_gpus,
         engine_state.clone(),
+        remote_state.clone(),
     ));
 
     // Enable the log viewer if the opt-in flag was passed (Linux only).

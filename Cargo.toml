@@ -41,6 +41,7 @@ reqwest = { version = "0.13", features = ["json"] }
 async-trait = "0.1"
 prometheus-parse = "0.2"
 futures-util = "0.3"
+tokio-tungstenite = "0.29"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nvml-wrapper = "0.12"
