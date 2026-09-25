@@ -1,4 +1,5 @@
 import { useMemo, useState, type ReactNode } from 'react'
+import type { HardwareSource } from '@/lib/dashboard/hardwareSource'
 import type { PageSource } from '@/lib/dashboard/pageSource'
 import { withSelectedEngine, withSelectedGpu, type SelectedTargets } from '@/lib/dashboard/selection'
 import { PageSelectionContext, type PageSelectionValue } from './usePageSelection'
@@ -18,9 +19,11 @@ import { PageSelectionContext, type PageSelectionValue } from './usePageSelectio
  */
 export function PageSelectionProvider({
   source,
+  hardware,
   children,
 }: {
   source?: PageSource
+  hardware?: HardwareSource
   children: ReactNode
 }) {
   const [chosen, setChosen] = useState<SelectedTargets>({})
@@ -29,10 +32,11 @@ export function PageSelectionProvider({
     (): PageSelectionValue => ({
       chosen,
       ...(source === undefined ? {} : { source }),
+      ...(hardware === undefined ? {} : { hardware }),
       selectGpu: (index) => setChosen((current) => withSelectedGpu(current, index)),
       selectEngine: (endpoint) => setChosen((current) => withSelectedEngine(current, endpoint)),
     }),
-    [chosen, source],
+    [chosen, source, hardware],
   )
 
   return <PageSelectionContext.Provider value={value}>{children}</PageSelectionContext.Provider>
