@@ -10,7 +10,8 @@ import { ConfigurationNotices } from './components/ConfigurationNotices'
 import { GridPageEditor } from './components/grid/GridPageEditor'
 import { PageBar } from './components/pages/PageBar'
 import { withPagePanels } from './lib/dashboard/editing'
-import { setPageSource } from './lib/dashboard/pages'
+import { setPageHardware, setPageSource } from './lib/dashboard/pages'
+import type { HardwareSource } from './lib/dashboard/hardwareSource'
 import type { PageSource } from './lib/dashboard/pageSource'
 import type { SaveOutcome } from './lib/dashboard/client'
 import type { DashboardDocument, DashboardPage, DashboardPanel } from './lib/dashboard/schema'
@@ -62,6 +63,17 @@ function DashboardPageView({ pageId }: { pageId: string | null }) {
     [document, page, save],
   )
 
+  // The hardware source follows the same rule: a page edit, written when it is
+  // made. Which machine a page reads is as deliberate a choice as which model
+  // it shows, and a kiosk page that belongs on dgx1 should say so on disk.
+  const saveHardware = useCallback(
+    (hardware: HardwareSource | null) =>
+      document && page
+        ? save(setPageHardware(document, page.id, hardware))
+        : Promise.resolve<SaveOutcome['status']>('failed'),
+    [document, page, save],
+  )
+
   return (
     <div className="h-dvh flex flex-col bg-[#08080a] overflow-hidden">
       <AppHeader
@@ -94,6 +106,7 @@ function DashboardPageView({ pageId }: { pageId: string | null }) {
             readOnly={readOnly}
             onSave={savePanels}
             onChangeSource={saveSource}
+            onChangeHardware={saveHardware}
             onEditingChange={setEditing}
           />
         )}

@@ -117,6 +117,12 @@ async function openPage(fetchMock: FetchMock) {
 
 const pageConfigButton = () => screen.getByRole('button', { name: 'Page config' })
 const configuration = () => screen.getByRole('region', { name: 'Page configuration' })
+/** The popover holds one group per axis it configures; a model choice and a
+ *  hardware choice must not be read as one list of options. */
+const modelGroup = () => within(configuration()).getByRole('group', { name: 'Model shown' })
+/** The hardware axis is asserted by its own specs (`hardwareSource.test.ts` and
+ *  App.hardwarePanels); this file is about the model axis, so the group is read
+ *  only where a model choice is clicked. */
 const followPanel = () => screen.getByRole('region', { name: 'Decode Throughput' })
 const pinnedPanel = () => screen.getByRole('region', { name: 'Pinned to Alpha' })
 
@@ -133,7 +139,9 @@ describe('the page configuration control', () => {
 
     await userEvent.click(pageConfigButton())
 
-    const options = within(configuration()).getAllByRole('button')
+    // Scoped to the model group: the popover also offers a machine group, and
+    // this assertion is about which models the page can be pointed at.
+    const options = within(modelGroup()).getAllByRole('button')
     expect(options.map((option) => option.textContent)).toEqual([
       'Automatic — first serving model',
       'All models — combined',

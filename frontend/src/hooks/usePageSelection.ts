@@ -1,4 +1,5 @@
 import { createContext, useContext } from 'react'
+import type { HardwareSource } from '@/lib/dashboard/hardwareSource'
 import type { PageSource } from '@/lib/dashboard/pageSource'
 import type { SelectedTargets } from '@/lib/dashboard/selection'
 
@@ -16,6 +17,12 @@ export interface PageSelectionValue {
   chosen: SelectedTargets
   /** The page's configured default (`DashboardPage.source`). Absent = automatic. */
   source?: PageSource
+  /**
+   * The machine whose hardware the page's hardware panels read
+   * (`DashboardPage.hardware`). Absent = this machine, which is what a page
+   * that has never been configured shows.
+   */
+  hardware?: HardwareSource
   /** Point every following panel at one GPU; null goes back to the host default. */
   selectGpu: (index: number | null) => void
   /** Point every following panel at one engine; null goes back to the host default. */

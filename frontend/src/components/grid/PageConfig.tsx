@@ -2,6 +2,13 @@ import { useState } from 'react'
 import { useDismissablePopover } from '@/hooks/useDismissablePopover'
 import { useLatestSnapshot } from '@/hooks/useMetricsStore'
 import {
+  hardwareChoices,
+  hardwareFromChoice,
+  type HardwareChoice,
+  type HardwareSource,
+} from '@/lib/dashboard/hardwareSource'
+import { mirroredPeers } from '@/lib/dashboard/pageHardware'
+import {
   pageSourceChoices,
   pageSourceFromChoice,
   type PageSource,
@@ -13,10 +20,14 @@ import { BarButton } from './BarButton'
 interface PageConfigProps {
   /** The page's stored source. Absent = automatic. */
   source?: PageSource
+  /** The machine whose hardware the page reads. Absent = this machine. */
+  hardware?: HardwareSource
   /** No save can succeed on this instance; the standing banner says why. */
   readOnly: boolean
   /** Writes the choice to the document. Null puts the page back on automatic. */
   onChange: (source: PageSource | null) => Promise<SaveOutcome['status']>
+  /** Writes the machine. Null puts the page back on this machine. */
+  onChangeHardware?: (hardware: HardwareSource | null) => Promise<SaveOutcome['status']>
 }
 
 /**
@@ -31,7 +42,7 @@ interface PageConfigProps {
  * the page list. The popover closes on a successful write and stays open over
  * a failed one, so the operator is looking at the choice that did not take.
  */
-export function PageConfig({ source, readOnly, onChange }: PageConfigProps) {
+export function PageConfig({ source, hardware, readOnly, onChange, onChangeHardware }: PageConfigProps) {
   const { open, setOpen, toggle, containerRef } = useDismissablePopover<HTMLDivElement>()
   // One write at a time: the loser of a race would be written from a document
   // that never had the winner's change.
@@ -39,11 +50,23 @@ export function PageConfig({ source, readOnly, onChange }: PageConfigProps) {
 
   const snapshot = useLatestSnapshot()
   const { value, choices } = pageSourceChoices(source, snapshot?.engines ?? [])
+  const { value: hardwareValue, choices: hardwareChoicesForPage } = hardwareChoices(
+    hardware,
+    mirroredPeers(snapshot),
+  )
 
   const choose = async (choice: PageSourceChoice) => {
     if (busy || choice.value === value) return
     setBusy(true)
     const status = await onChange(pageSourceFromChoice(choice.value))
+    setBusy(false)
+    if (status === 'saved') setOpen(false)
+  }
+
+  const chooseHardware = async (choice: HardwareChoice) => {
+    if (!onChangeHardware || busy || choice.value === hardwareValue) return
+    setBusy(true)
+    const status = await onChangeHardware(hardwareFromChoice(choice.value))
     setBusy(false)
     if (status === 'saved') setOpen(false)
   }
@@ -78,6 +101,26 @@ export function PageConfig({ source, readOnly, onChange }: PageConfigProps) {
               />
             ))}
           </div>
+
+          {onChangeHardware && (
+            <>
+              <p className="pt-1 text-[11px] text-zinc-500 leading-snug">
+                Whose hardware this page's hardware panels read. Remote machines come
+                from the dashboard's mirrored peers.
+              </p>
+              <div className="flex flex-col gap-1" role="group" aria-label="Hardware shown">
+                {hardwareChoicesForPage.map((choice) => (
+                  <SourceOption
+                    key={choice.value}
+                    choice={choice}
+                    selected={choice.value === hardwareValue}
+                    disabled={readOnly || busy}
+                    onChoose={() => void chooseHardware(choice)}
+                  />
+                ))}
+              </div>
+            </>
+          )}
         </section>
       )}
     </div>

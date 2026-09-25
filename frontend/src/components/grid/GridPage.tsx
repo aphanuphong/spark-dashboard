@@ -213,7 +213,7 @@ export function GridPage({
           on this page reads the same GPU and engine, and a page mounted at
           another id starts from its own configured source — or the host's
           defaults — again. */}
-      <PageSelectionProvider source={page.source}>
+      <PageSelectionProvider source={page.source} hardware={page.hardware}>
         <GridStack
           options={options}
           onChange={draggable ? handleChange : undefined}

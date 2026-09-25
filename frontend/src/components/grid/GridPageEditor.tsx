@@ -12,6 +12,7 @@ import {
   repointPanel,
   setPanelWindow,
 } from '@/lib/dashboard/editing'
+import type { HardwareSource } from '@/lib/dashboard/hardwareSource'
 import type { PageSource } from '@/lib/dashboard/pageSource'
 import { defaultPanelTitle, type PanelType } from '@/lib/dashboard/panels'
 import type { DashboardPage, DashboardPanel } from '@/lib/dashboard/schema'
@@ -48,6 +49,12 @@ interface GridPageEditorProps {
    */
   onChangeSource?: (source: PageSource | null) => Promise<SaveOutcome['status']>
   /**
+   * Writes the page's hardware source — whose hardware its hardware panels
+   * read. Same terms as `onChangeSource`: written when made, not part of the
+   * edit session, withheld when there is nowhere to write it.
+   */
+  onChangeHardware?: (hardware: HardwareSource | null) => Promise<SaveOutcome['status']>
+  /**
    * Whether a session is open, for the page list in the header. The session is a
    * working copy that dies with this component, so switching pages while one is
    * open would throw it away — the header withholds that until it is settled.
@@ -75,6 +82,7 @@ export function GridPageEditor({
   readOnly,
   onSave,
   onChangeSource,
+  onChangeHardware,
   onEditingChange,
 }: GridPageEditorProps) {
   const [session, setSession] = useState<EditSession | null>(null)
@@ -224,7 +232,13 @@ export function GridPageEditor({
         refused={refused}
         pageConfig={
           onChangeSource && (
-            <PageConfig source={page.source} readOnly={readOnly} onChange={onChangeSource} />
+            <PageConfig
+              source={page.source}
+              hardware={page.hardware}
+              readOnly={readOnly}
+              onChange={onChangeSource}
+              onChangeHardware={onChangeHardware}
+            />
           )
         }
         onBegin={() => setSession({ panels: page.panels, refused: null, configuringId: null })}
