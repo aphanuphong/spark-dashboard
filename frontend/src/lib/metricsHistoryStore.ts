@@ -43,7 +43,7 @@ const SYSTEM_METRIC_KEYS: MetricKey[] = [
   'networkTx',
 ]
 
-const GPU_METRIC_KEYS: MetricKey[] = [
+const GPU_METRIC_KEYS: GpuSeriesMetric[] = [
   'gpuUtil',
   'gpuTemp',
   'gpuPower',
@@ -69,6 +69,30 @@ export type GpuSeriesMetric =
  */
 export function gpuSeries(metric: GpuSeriesMetric, gpuIndex: number, multiGpu: boolean): string {
   return multiGpu ? `gpu:${gpuIndex}:${metric}` : metric
+}
+
+/**
+ * The series key of one metric of a mirrored peer. The delimiter is `~`, not
+ * `:`: a peer is identified by its URL, which is full of colons, and the
+ * buffer resolver splits series at the *last* colon. URLs in practice contain
+ * no `~`, which is what makes it the delimiter.
+ *
+ * Unlike `gpuSeries`, remote keys are always GPU-prefixed (`gpu:<index>:…`) —
+ * there is no legacy un-prefixed rendering of a peer's primary GPU to keep
+ * byte-identical with.
+ */
+export function remoteSeries(url: string, metric: string): string {
+  return `${url}~${metric}`
+}
+
+/** One of a peer's GPU's metrics; see `remoteSeries` for the key grammar. */
+export function remoteGpuSeries(url: string, metric: GpuSeriesMetric, gpuIndex: number): string {
+  return remoteSeries(url, `gpu:${gpuIndex}:${metric}`)
+}
+
+/** The series key of a peer's GPU-event buffer, for subscriptions. */
+export function remoteEventsSeries(url: string): string {
+  return remoteSeries(url, EVENTS_SERIES)
 }
 
 type EngineMetricsShape = NonNullable<MetricsSnapshot['engines'][number]['metrics']>
@@ -234,6 +258,12 @@ function extractValue(metrics: MetricsSnapshot, key: MetricKey): number | null {
 export class MetricsHistoryStore {
   private buffers = createBuffers()
   private gpuBuffers: Record<string, Record<MetricKey, CircularBuffer<DataPoint>>> = {}
+  /** Per-peer host series, keyed by the peer URL from the snapshot's `remote[]`. */
+  private remoteBuffers: Record<string, Record<MetricKey, CircularBuffer<DataPoint>>> = {}
+  /** Per-peer GPU series, keyed by peer URL then GPU index. */
+  private remoteGpuBuffers: Record<string, Record<string, Record<MetricKey, CircularBuffer<DataPoint>>>> = {}
+  /** Peer event buffers, keyed by peer URL. */
+  private remoteEventBuffers: Record<string, CircularBuffer<GpuEventData>> = {}
   private engineBuffers: Record<string, Record<string, CircularBuffer<DataPoint>>> = {}
   private eventBuffer = new CircularBuffer<GpuEventData>(EVENT_BUFFER_CAPACITY)
   private requestBuffers: Record<string, CircularBuffer<InferenceRequestData>> = {}
@@ -278,6 +308,14 @@ export class MetricsHistoryStore {
           changed.add(`gpu:${gpuKey}:${key}`)
         }
       }
+    }
+
+    // Peer snapshots ride along inside the local snapshot (`remote[]`, one
+    // full MetricsSnapshot per mirrored dashboard). Ingest them as their own
+    // host: same field extractions, series names keyed by the peer's URL, so
+    // a page pointed at a peer charts its history instead of this box's.
+    for (const host of metrics.remote ?? []) {
+      if (host.data) this.ingestHost(host.url, host.data, ts, changed)
     }
 
     for (const engine of metrics.engines) {
@@ -327,6 +365,58 @@ export class MetricsHistoryStore {
       if (listeners) for (const listener of listeners) listener()
     }
     for (const listener of this.allListeners) listener()
+  }
+
+  /** Append one peer's snapshot to that peer's buffers, on the same terms as
+   *  a local snapshot: values only, timestamps of this ingest, changed-series
+   *  bookkeeping. A peer's engine stats are not ingested — engine panels
+   *  read this host's engines; what mirrors across is hardware. */
+  private ingestHost(
+    url: string,
+    metrics: MetricsSnapshot,
+    ts: number,
+    changed: Set<string>,
+  ): void {
+    if (!this.remoteBuffers[url]) {
+      this.remoteBuffers[url] = createBuffers()
+    }
+    const host = this.remoteBuffers[url]
+    for (const key of SYSTEM_METRIC_KEYS) {
+      const val = extractValue(metrics, key)
+      if (val !== null) {
+        host[key].push({ timestamp: ts, value: val })
+        changed.add(remoteSeries(url, key))
+      }
+    }
+
+    if (!this.remoteGpuBuffers[url]) {
+      this.remoteGpuBuffers[url] = {}
+    }
+    const gpuSets = this.remoteGpuBuffers[url]
+    for (const gpu of snapshotGpus(metrics)) {
+      const index = String(gpuIndexOf(gpu))
+      if (!gpuSets[index]) {
+        gpuSets[index] = createBuffers()
+      }
+      const gb = gpuSets[index]
+      for (const key of GPU_METRIC_KEYS) {
+        const val = extractGpuValue(gpu, key)
+        if (val !== null) {
+          gb[key].push({ timestamp: ts, value: val })
+          changed.add(remoteGpuSeries(url, key, Number(index)))
+        }
+      }
+    }
+
+    if (metrics.gpu_events && metrics.gpu_events.length > 0) {
+      if (!this.remoteEventBuffers[url]) {
+        this.remoteEventBuffers[url] = new CircularBuffer<GpuEventData>(EVENT_BUFFER_CAPACITY)
+      }
+      for (const event of metrics.gpu_events) {
+        this.remoteEventBuffers[url].push(event)
+      }
+      changed.add(remoteEventsSeries(url))
+    }
   }
 
   /** Append one tick of engine-shaped metrics to the buffer set under `key` —
@@ -402,6 +492,21 @@ export class MetricsHistoryStore {
     const systemBuffer = this.buffers[metric as MetricKey]
     if (systemBuffer) return systemBuffer
 
+    // Remote series split at the last `~`, so a URL carrying colons cannot
+    // confuse the split (`remoteSeries` is the single definition of the key).
+    const delimiter = metric.lastIndexOf('~')
+    if (delimiter > 0) {
+      const url = metric.slice(0, delimiter)
+      const rest = metric.slice(delimiter + 1)
+      const remoteGpuMatch = rest.match(
+        /^gpu:(\d+):(gpuUtil|gpuTemp|gpuPower|gpuClockGraphics|gpuMemory|gpuFan)$/,
+      )
+      if (remoteGpuMatch) {
+        return this.remoteGpuBuffers[url]?.[remoteGpuMatch[1]]?.[remoteGpuMatch[2] as MetricKey]
+      }
+      return this.remoteBuffers[url]?.[rest as MetricKey]
+    }
+
     const gpuMatch = metric.match(
       /^gpu:(\d+):(gpuUtil|gpuTemp|gpuPower|gpuClockGraphics|gpuMemory|gpuFan)$/,
     )
@@ -426,9 +531,11 @@ export class MetricsHistoryStore {
     return buffer.toArray().filter((dp) => dp.timestamp >= cutoff)
   }
 
-  getEvents(window: TimeWindow = DEFAULT_TIME_WINDOW): GpuEventData[] {
+  getEvents(window: TimeWindow = DEFAULT_TIME_WINDOW, url?: string): GpuEventData[] {
     const cutoff = this.cutoff(window)
-    return this.eventBuffer.toArray().filter((e) => e.timestamp_ms >= cutoff)
+    const buffer = url === undefined ? this.eventBuffer : this.remoteEventBuffers[url]
+    if (!buffer) return []
+    return buffer.toArray().filter((e) => e.timestamp_ms >= cutoff)
   }
 
   /** Recent requests, optionally narrowed to one engine. `key` is an engine

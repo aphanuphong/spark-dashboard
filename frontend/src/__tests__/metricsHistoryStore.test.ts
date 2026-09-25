@@ -5,6 +5,9 @@ import {
   gpuMemoryPercent,
   gpuSeries,
   MetricsHistoryStore,
+  remoteEventsSeries,
+  remoteGpuSeries,
+  remoteSeries,
 } from '../lib/metricsHistoryStore'
 import type { EngineSnapshot, GpuMetrics, MetricsSnapshot } from '../types/metrics'
 
@@ -32,9 +35,10 @@ function makeSnapshot(
     temp?: number | null
     engines?: EngineSnapshot[]
     gpu_events?: MetricsSnapshot['gpu_events']
+    remote?: MetricsSnapshot['remote']
   } = {},
 ): MetricsSnapshot {
-  const { util = 11, temp = 40, engines = [], gpu_events = [] } = overrides
+  const { util = 11, temp = 40, engines = [], gpu_events = [], remote = [] } = overrides
   return {
     timestamp_ms: ts,
     gpu: { ...GPU, utilization_percent: util, temperature_celsius: temp },
@@ -54,6 +58,7 @@ function makeSnapshot(
     network: { name: 'net', rx_bytes_per_sec: 3, tx_bytes_per_sec: 4 },
     engines,
     gpu_events,
+    remote,
   }
 }
 
@@ -306,6 +311,115 @@ describe('gpuSeries', () => {
     expect(store.getChartData(gpuSeries('gpuMemory', 0, true)).map((p) => p.value)).toEqual([25])
     expect(store.getChartData('gpuFan').map((p) => p.value)).toEqual([30])
     expect(store.getChartData(gpuSeries('gpuFan', 0, true)).map((p) => p.value)).toEqual([30])
+  })
+})
+
+describe('mirrored-peer history', () => {
+  const DGX = 'http://dgx1.rt-ctrl.com:3000'
+
+  function peer(ts: number, util: number, extra: Record<string, unknown> = {}): MetricsSnapshot['remote'] {
+    return [{ url: DGX, label: 'dgx1', connected: true, data: makeSnapshot(ts, { util, ...extra }) }]
+  }
+
+  it('keys a peer series by its URL with the ~ delimiter', () => {
+    // `:` is what a URL is made of, so the delimiter has to be something the
+    // URL never contains — and the split has to find the *last* one.
+    expect(remoteSeries(DGX, 'cpuAggregate')).toBe(`${DGX}~cpuAggregate`)
+    expect(remoteGpuSeries(DGX, 'gpuUtil', 1)).toBe(`${DGX}~gpu:1:gpuUtil`)
+    expect(remoteEventsSeries(DGX)).toBe(`${DGX}~events`)
+  })
+
+  it('ingests a peer’s hardware beside this host’s, each under its own keys', () => {
+    const store = new MetricsHistoryStore()
+    store.ingest(makeSnapshot(1000, { util: 11 }))
+    store.ingest(makeSnapshot(2000, { util: 21, remote: peer(2000, 77) }))
+
+    expect(store.getChartData('gpuUtil', '15m').map((p) => p.value)).toEqual([11, 21])
+    expect(store.getChartData(remoteSeries(DGX, 'gpuUtil'), '15m').map((p) => p.value)).toEqual([77])
+  })
+
+  it('keys every peer GPU, with no single-GPU exception', () => {
+    const store = new MetricsHistoryStore()
+    store.ingest(makeSnapshot(1000, { remote: peer(1000, 77) }))
+
+    // Even a peer's first GPU reads as `gpu:0:…`; the un-prefixed legacy key
+    // belongs to this host, so it carries this host's values and never the
+    // peer's — that is what keeps a local panel honest about whose box it shows.
+    expect(store.getChartData(remoteGpuSeries(DGX, 'gpuUtil', 0), '15m')).toEqual([
+      { timestamp: 1000, value: 77 },
+    ])
+    expect(store.getChartData('gpuUtil', '15m')).toEqual([{ timestamp: 1000, value: 11 }])
+  })
+
+  it('does not ingest a peer’s engine stats', () => {
+    const store = new MetricsHistoryStore()
+    store.ingest(
+      makeSnapshot(1000, {
+        remote: peer(1000, 77, { engines: [makeEngine(123)] }),
+      }),
+    )
+
+    // Engine panels read this host's engines; what mirrors across is hardware.
+    // Had the peer's engine been ingested, it would have landed under this
+    // exact key — the peer's snapshot carries a `localhost:8000` engine.
+    expect(store.getChartData('Vllm-http://localhost:8000:tps', '15m')).toEqual([])
+    expect(store.getChartData('gpuUtil', '15m')).toEqual([{ timestamp: 1000, value: 11 }])
+  })
+
+  it('ingests nothing for a peer that is listed but down', () => {
+    const store = new MetricsHistoryStore()
+    store.ingest(
+      makeSnapshot(1000, {
+        remote: [{ url: DGX, label: 'dgx1', connected: false, data: null }],
+      }),
+    )
+
+    expect(store.getChartData(remoteSeries(DGX, 'cpuAggregate'), '15m')).toEqual([])
+    expect(store.seriesVersion(remoteSeries(DGX, 'cpuAggregate'))).toBe(0)
+  })
+
+  it('notifies only the series a peer snapshot actually changed', () => {
+    const store = new MetricsHistoryStore()
+    const peerUtil = vi.fn()
+    const peerTemp = vi.fn()
+    store.subscribe(remoteSeries(DGX, 'gpuUtil'), peerUtil)
+    store.subscribe(remoteGpuSeries(DGX, 'gpuTemp', 0), peerTemp)
+
+    store.ingest(makeSnapshot(1000, { remote: peer(1000, 77, { temp: null }) }))
+
+    expect(peerUtil).toHaveBeenCalledTimes(1)
+    expect(peerTemp).not.toHaveBeenCalled()
+  })
+
+  it('reads a peer’s GPU events from its own buffer, not this host’s', () => {
+    const store = new MetricsHistoryStore()
+    store.ingest(
+      makeSnapshot(1000, {
+        gpu_events: [{ timestamp_ms: 1000, gpu_index: 0, event_type: 'thermal', detail: 'local' }],
+        remote: peer(1000, 77, {
+          gpu_events: [{ timestamp_ms: 1000, gpu_index: 0, event_type: 'power_brake', detail: 'peer' }],
+        }),
+      }),
+    )
+
+    expect(store.getEvents('15m').map((e) => e.detail)).toEqual(['local'])
+    expect(store.getEvents('15m', DGX).map((e) => e.detail)).toEqual(['peer'])
+  })
+
+  it('subscribes the peer event series', () => {
+    const store = new MetricsHistoryStore()
+    const listener = vi.fn()
+    store.subscribe(remoteEventsSeries(DGX), listener)
+
+    store.ingest(
+      makeSnapshot(1000, {
+        remote: peer(1000, 77, {
+          gpu_events: [{ timestamp_ms: 1000, gpu_index: 0, event_type: 'thermal', detail: 'peer' }],
+        }),
+      }),
+    )
+
+    expect(listener).toHaveBeenCalledTimes(1)
   })
 })
 

@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useMemo, useSyncExternalStore }
 import {
   EVENTS_SERIES,
   MetricsHistoryStore,
+  remoteEventsSeries,
   requestsSeries,
   type DataPoint,
 } from '@/lib/metricsHistoryStore'
@@ -58,14 +59,21 @@ export function useMetricSeries(
  * Events are a discrete list rather than a series, so they cannot come through
  * `useMetricSeries` — but they are subscribed and frozen on exactly the same
  * terms, because a panel showing them is a panel like any other.
+ *
+ * `url` reads a mirrored peer's event buffer instead of this host's: the page's
+ * hardware source decides which machine a GPU panel belongs to, and a peer's
+ * events live under their own series key.
  */
-export function useGpuEvents(window: TimeWindow = DEFAULT_TIME_WINDOW): GpuEventData[] {
+export function useGpuEvents(
+  window: TimeWindow = DEFAULT_TIME_WINDOW,
+  url?: string,
+): GpuEventData[] {
   const store = useMetricsStore()
-  const version = useSeriesVersion(EVENTS_SERIES)
+  const version = useSeriesVersion(url === undefined ? EVENTS_SERIES : remoteEventsSeries(url))
   const events = useMemo(() => {
     void version // an event landed; re-read the window
-    return store.getEvents(window)
-  }, [store, window, version])
+    return store.getEvents(window, url)
+  }, [store, window, url, version])
   return useHeldWhileFrozen(events)
 }
 
