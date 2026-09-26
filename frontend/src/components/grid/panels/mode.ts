@@ -108,7 +108,8 @@ export function coreGridLayout({ width, height }: ElementSize, cores: number): C
  * boxes get the cap, consistent with `hardwarePanelMode`'s richest-layout
  * fallback.
  */
-export function gaugeSizePx(height: number): number {
+export function gaugeSizePx(height: number, count = 1): number {
   if (height <= 0) return 96
-  return Math.max(40, Math.min(96, height - 8))
+  if (count <= 1) return Math.max(40, Math.min(96, height - 8))
+  return Math.max(36, Math.min(96, (height - 8) / count))
 }

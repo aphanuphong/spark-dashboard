@@ -1,28 +1,64 @@
 import { ArcGauge } from '@/components/gauges/ArcGauge'
 import { HBar } from '@/components/gauges/HBar'
 import { TimeSeriesChart } from '@/components/charts/TimeSeriesChart'
-import { gpuLabel } from './gpuLabel'
+import { gpuIndexOf } from '@/lib/identity'
+import { gpuLabel, gpuPanelDevice } from './gpuLabel'
+import { gpuSeriesColor } from './gpuColor'
 import { GpuPanelNotice } from './PanelNotice'
 import { HardwarePanelBody } from './HardwarePanelBody'
-import { useGpuPanelSeries } from './useGpuPanel'
-import { hardwareDeviceForGpu } from './useHardwarePanel'
+import { MultiGpuPanelBody } from './MultiGpuPanelBody'
+import { useGpuPanelSeriesAll } from './useGpuPanel'
 import type { PanelContentProps } from '../panelRegistry'
 
-/** One GPU's utilization: gauge plus trend over the panel's own window. */
+/**
+ * GPU utilization. On a single-GPU machine — or on a panel pinned to one GPU,
+ * or on a mirrored peer like DGX1 — one gauge and one line. On this box when
+ * it has more than one GPU, every GPU at once: one gauge per GPU stacked in
+ * the gauge column, and all of their lines sharing one chart so the two 5090s
+ * can be compared directly.
+ */
 export function GpuUtilizationPanel({ panel }: PanelContentProps) {
-  const { resolution, data } = useGpuPanelSeries(panel, 'gpuUtil')
+  const aggregate = useGpuPanelSeriesAll(panel, 'gpuUtil')
+  const { resolution } = aggregate
   if (resolution.status !== 'resolved') return <GpuPanelNotice resolution={resolution} />
+
+
+  if (aggregate.view === 'all') {
+    return (
+      <MultiGpuPanelBody
+        device={gpuPanelDevice(aggregate.gpus.map((g) => g.gpu), resolution)}
+        entries={aggregate.gpus.map(({ gpu }) => {
+          const value = gpu.utilization_percent ?? 0
+          const label = `GPU ${gpuIndexOf(gpu)}`
+          return {
+            compact: <HBar value={value} label={label} unit="%" />,
+            gauge: (sizePx) => <ArcGauge value={value} label={label} unit="%" size={sizePx} />,
+          }
+        })}
+        chart={
+          <TimeSeriesChart
+            series={aggregate.gpus.map(({ gpu }, i) => ({
+              label: `GPU ${gpuIndexOf(gpu)}`,
+              data: aggregate.perGpu[i],
+              color: gpuSeriesColor(i),
+            }))}
+            yDomain={[0, 100]}
+            unit="%"
+          />
+        }
+      />
+    )
+  }
 
   const value = resolution.gpu.utilization_percent ?? 0
   const label = gpuLabel(resolution, 'GPU Util')
-
   return (
     <HardwarePanelBody
-      device={hardwareDeviceForGpu(resolution.gpu.name, resolution)}
+      device={gpuPanelDevice([resolution.gpu], resolution)}
       compact={<HBar value={value} label={label} unit="%" />}
       gauge={(sizePx) => <ArcGauge value={value} label={label} unit="%" size={sizePx} />}
       chart={
-        <TimeSeriesChart data={data} yDomain={[0, 100]} unit="%" seriesLabel="GPU" />
+        <TimeSeriesChart data={aggregate.data} yDomain={[0, 100]} unit="%" seriesLabel="GPU" />
       }
     />
   )

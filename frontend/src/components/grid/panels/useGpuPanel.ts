@@ -101,3 +101,87 @@ export function useGpuPanelSeries(
   const data = useMetricSeries(series, panel.window)
   return { resolution, data }
 }
+
+/**
+ * What an *aggregate* GPU panel renders: every GPU the machine has, at once.
+ *
+ * A following panel (binding `follow`, or one pinned to the page's GPU) that
+ * lands on a multi-GPU machine shows all of its GPUs together — two gauges and
+ * two chart lines on a two-GPU box like archml's, one of each on a single-GPU
+ * box or a mirrored peer, where that is simply what the machine is. A panel
+ * pinned to one GPU keeps showing exactly that GPU: a pin is an explicit ask,
+ * and an aggregate view would bury the target the operator retitled the panel
+ * for. This is also what makes DGX1 correct: it has one GPU, so pointing a
+ * multi-GPU box's utilization panel at it narrows to one gauge and one line
+ * without the panel knowing or caring.
+ */
+export type GpuAggregate =
+  /** Show exactly what `useGpuPanelSeries` says: the machine is a single-GPU
+   *  one, or this panel's binding pinned one GPU. */
+  | { view: 'one'; resolution: GpuPanelResolution; data: DataPoint[] }
+  /** Every GPU's current value plus one chart series each, in GPU order. */
+  | {
+      view: 'all'
+      resolution: Extract<GpuPanelResolution, { status: 'resolved' }>
+      gpus: Array<{
+        gpu: GpuMetrics
+        /** The history series key for this GPU's metric. */
+        series: string
+      }>
+      /** Charted data per GPU, index-aligned with `gpus`. */
+      perGpu: DataPoint[][]
+    }
+
+/**
+ * `useGpuPanelSeries` on aggregate terms: the panel subscribes to every GPU's
+ * series when there is more than one to show. Four subscriptions, fixed —
+ * hook order cannot depend on how many GPUs the machine happens to have, and
+ * the rendering ladder names colors for four GPUs anyway.
+ */
+export function useGpuPanelSeriesAll(
+  panel: DashboardPanel,
+  metric: GpuSeriesMetric,
+): GpuAggregate {
+  const resolution = useGpuPanel(panel)
+  const resolved = resolution.status === 'resolved'
+  const aggregate = resolved && resolution.multiGpu && panel.binding.kind !== 'gpu'
+
+  const gpus = resolved ? snapshotGpus(resolution.snapshot) : []
+  // `seriesFor` builds the key of the single resolved GPU; a whole-machine
+  // view needs each GPU's own key, so a following panel builds them itself.
+  // A mirrored peer keys all of its GPUs, including its first one.
+  const keys = resolved
+    ? aggregate
+      ? resolution.peer
+        ? gpus.map((gpu) => remoteGpuSeries(resolution.peer!.url, metric, gpuIndexOf(gpu)))
+        : gpus.map((gpu) => gpuSeries(metric, gpuIndexOf(gpu), true))
+      : [resolution.seriesFor(metric)]
+    : []
+
+  const d0 = useMetricSeries(keys[0] ?? idleSeries(metric), panel.window)
+  const d1 = useMetricSeries(keys[1] ?? idleSeries(metric), panel.window)
+  const d2 = useMetricSeries(keys[2] ?? idleSeries(metric), panel.window)
+  const d3 = useMetricSeries(keys[3] ?? idleSeries(metric), panel.window)
+  const perGpu = [d0, d1, d2, d3]
+
+  if (aggregate) {
+    const shown = Math.min(gpus.length, perGpu.length)
+    return {
+      view: 'all',
+      resolution,
+      gpus: gpus.slice(0, shown).map((gpu, i) => ({ gpu, series: keys[i] })),
+      perGpu: perGpu.slice(0, shown),
+    }
+  }
+  return { view: 'one', resolution, data: perGpu[0] ?? [] }
+}
+
+/**
+ * A series that exists in no buffer. Subscribing costs the store nothing and
+ * reading it returns nothing — the slot draws no line — which is how unused
+ * hook positions pass through a panel on a machine with fewer GPUs.
+ */
+function idleSeries(metric: GpuSeriesMetric): string {
+  return `~unused~${metric}`
+}
+
