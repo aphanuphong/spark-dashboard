@@ -62,6 +62,10 @@ services:
       - SPARK_DASHBOARD_GPU_INDEX
       - SPARK_DASHBOARD_SIMULATE_GPUS=${SPARK_DASHBOARD_SIMULATE_GPUS:-0}
       - SPARK_DASHBOARD_PROVIDER_API_KEY=${SPARK_DASHBOARD_PROVIDER_API_KEY:-}
+      # Headless collector mode. 0 drops the browser UI (static frontend +
+      # config API answer 404) while /ws and /healthz keep serving, so a peer
+      # dashboard can mirror this host's hardware. 1 (default) is a normal UI.
+      - SPARK_DASHBOARD_SERVE_UI=${SPARK_DASHBOARD_SERVE_UI:-1}
       # Opt-in log viewer (/ws/logs). Off by default: the endpoint is
       # unauthenticated and engine logs can contain prompts — see the README's
       # "Log viewer" section before enabling.

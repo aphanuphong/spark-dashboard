@@ -26,6 +26,11 @@ const READ_ONLY_HEADER: &str = "x-spark-dashboard-read-only";
 pub struct AppState {
     pub metrics_tx: broadcast::Sender<String>,
     pub config: Arc<ConfigStore>,
+    /// When false, the server serves the collector surface (`/ws`, `/healthz`)
+    /// but nothing else: every request the browser UI needs answers 404. This
+    /// is the headless-collector mode — a machine that only feeds hardware
+    /// snapshots to a peer dashboard.
+    pub serve_ui: bool,
 }
 
 impl FromRef<AppState> for broadcast::Sender<String> {
@@ -35,22 +40,30 @@ impl FromRef<AppState> for broadcast::Sender<String> {
 }
 
 pub fn create_router(state: AppState) -> Router {
-    let api = Router::new()
-        .route(
-            "/dashboard",
-            get(get_dashboard)
-                .put(put_dashboard)
-                .delete(delete_dashboard),
-        )
-        // One cap, enforced twice at the same threshold: the layer stops the
-        // server buffering anything larger, and the handler rejects a body that
-        // is exactly one byte over so the limit is ours rather than a tower
-        // default that could drift.
-        .layer(DefaultBodyLimit::max(MAX_DOCUMENT_BYTES + 1))
-        // Without this, the SPA fallback below would answer a typo'd or
-        // unregistered API path with the app shell and status 200 — a client bug
-        // would look like success.
-        .fallback(api_not_found);
+    let serve_ui = state.serve_ui;
+    let api = if serve_ui {
+        Router::new()
+            .route(
+                "/dashboard",
+                get(get_dashboard)
+                    .put(put_dashboard)
+                    .delete(delete_dashboard),
+            )
+            // One cap, enforced twice at the same threshold: the layer stops the
+            // server buffering anything larger, and the handler rejects a body that
+            // is exactly one byte over so the limit is ours rather than a tower
+            // default that could drift.
+            .layer(DefaultBodyLimit::max(MAX_DOCUMENT_BYTES + 1))
+            // Without this, the SPA fallback below would answer a typo'd or
+            // unregistered API path with the app shell and status 200 — a client bug
+            // would look like success.
+            .fallback(api_not_found)
+    } else {
+        // Headless collector: the config API belongs to the browser UI, so
+        // every /api path — registered or not — answers 404. Nesting routes
+        // would outrank the fallback, so the gate has to be this router itself.
+        Router::new().fallback(api_not_found)
+    };
 
     // `mut` is only exercised by the Linux-gated log-viewer block below.
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
@@ -199,7 +212,13 @@ fn read_only_headers(state: &AppState) -> [(axum::http::HeaderName, String); 1] 
     )]
 }
 
-async fn static_handler(uri: axum::http::Uri) -> impl IntoResponse {
+async fn static_handler(State(state): State<AppState>, uri: axum::http::Uri) -> impl IntoResponse {
+    // Headless collector: no browser UI is served, so nothing beyond the
+    // explicitly-registered routes exists as far as a client is concerned.
+    if !state.serve_ui {
+        return not_found();
+    }
+
     let mut path = uri.path().trim_start_matches('/');
 
     // The nested API router's own fallback catches most unmatched API paths, but
@@ -244,10 +263,15 @@ mod tests {
     /// Spawns the server over a fresh state directory and returns its address
     /// alongside the directory guard, which must stay alive for the test.
     async fn spawn(state_dir: &std::path::Path) -> String {
+        spawn_with_ui(state_dir, true).await
+    }
+
+    async fn spawn_with_ui(state_dir: &std::path::Path, serve_ui: bool) -> String {
         let (tx, _rx) = broadcast::channel::<String>(16);
         let state = AppState {
             metrics_tx: tx,
             config: Arc::new(ConfigStore::new(state_dir).await),
+            serve_ui,
         };
         let app = create_router(state);
 
@@ -258,6 +282,24 @@ mod tests {
         });
 
         format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn headless_collector_serves_the_probe_but_no_ui() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = spawn_with_ui(dir.path(), false).await;
+
+        // The collector contract a peer dashboard depends on:
+        // liveness stays probeable, the snapshot socket stays open.
+        let health = reqwest::get(format!("{base}/healthz")).await.unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::OK);
+        assert_eq!(health.text().await.unwrap(), "ok");
+
+        // Everything a browser would need answers 404 — no shell, no config API.
+        let root = reqwest::get(format!("{base}/")).await.unwrap();
+        assert_eq!(root.status(), reqwest::StatusCode::NOT_FOUND);
+        let doc = reqwest::get(format!("{base}/api/dashboard")).await.unwrap();
+        assert_eq!(doc.status(), reqwest::StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

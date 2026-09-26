@@ -46,13 +46,18 @@ mod tests {
     fn the_image_pre_creates_the_binarys_default_state_directory() {
         // Owned by the runtime uid, because Docker seeds a fresh named volume
         // from the image — including ownership — and a distroless runtime has no
-        // shell to fix it up afterwards.
-        let expected = format!(
-            "COPY --from=builder --chown=65532:65532 --chmod=750 /state {DEFAULT_STATE_DIR}"
+        // shell to fix it up afterwards. The mode is set in the builder stage
+        // (`chmod 750 /state`); the legacy builder does not support `--chmod` on
+        // COPY, so only ownership rides the copy itself.
+        let mode = "RUN mkdir -p /state && chmod 750 /state";
+        assert!(
+            DOCKERFILE.lines().any(|line| line.trim() == mode),
+            "Dockerfile should set the state directory mode in the builder: `{mode}`"
         );
+        let expected = format!("COPY --from=builder --chown=65532:65532 /state {DEFAULT_STATE_DIR}");
         assert!(
             DOCKERFILE.lines().any(|line| line.trim() == expected),
-            "Dockerfile should contain `{expected}`"
+            "Dockerfile should contain `{expected}"
         );
     }
 

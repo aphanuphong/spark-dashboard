@@ -161,6 +161,20 @@ struct RunArgs {
     )]
     remote: Vec<String>,
 
+    /// Serve the browser UI (static frontend and dashboard config API).
+    /// Set to 0 for a headless collector: `/ws` and `/healthz` keep working,
+    /// so peers can mirror this host's hardware, but every browser request
+    /// answers 404.
+    #[arg(
+        long,
+        env = "SPARK_DASHBOARD_SERVE_UI",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true"
+    )]
+    serve_ui: bool,
+
     /// Enable the experimental log viewer at /ws/logs (Linux only).
     ///
     /// When set, the dashboard streams container logs from the Docker daemon
@@ -312,9 +326,14 @@ async fn run_server_inner(args: RunArgs) -> Result<(), Box<dyn std::error::Error
         args.state_dir
     );
 
+    if !args.serve_ui {
+        tracing::info!("Headless collector mode: serving /ws and /healthz only (no UI)");
+    }
+
     let app = server::create_router(server::AppState {
         metrics_tx: tx,
         config,
+        serve_ui: args.serve_ui,
     });
 
     let addr = format!("{}:{}", args.bind, args.port);
