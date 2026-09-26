@@ -258,17 +258,20 @@ describe('the hardware panels on a grid page', () => {
       ]),
     )
 
-    // The following panel resolves to the primary GPU; the pinned one to GPU 1
-    // — both value and chart series, so the label and the data agree.
+    // A following panel on a multi-GPU host shows the whole machine at once:
+    // both gauges, and each GPU charted under its own name. The pinned panel
+    // still reads exactly the GPU it was pinned to — a pin is an explicit ask.
     const following = region('GPU Utilization')
     expect(within(following).getByText('11')).toBeInTheDocument()
-    expect(within(following).getByTestId('chart')).toHaveAttribute('data-values', '11')
+    expect(within(following).getByText('77')).toBeInTheDocument()
+    expect(within(following).getByTestId('chart-series-GPU 0')).toHaveAttribute('data-values', '11')
+    expect(within(following).getByTestId('chart-series-GPU 1')).toHaveAttribute('data-values', '77')
 
     const pinned = region('Second GPU')
     expect(within(pinned).getByText('77')).toBeInTheDocument()
     expect(within(pinned).getByTestId('chart')).toHaveAttribute('data-values', '77')
 
-    // With several GPUs, each panel names the one it shows.
+    // With several GPUs, each panel names the GPUs it shows.
     expect(within(following).getByText('GPU 0')).toBeInTheDocument()
     expect(within(pinned).getByText('GPU 1')).toBeInTheDocument()
   })

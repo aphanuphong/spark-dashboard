@@ -23,10 +23,21 @@ import type { GpuMetrics, MetricsSnapshot } from '../types/metrics'
 substituteWebSocket()
 
 vi.mock('@/components/charts/TimeSeriesChart', () => ({
-  TimeSeriesChart: (props: { data?: Array<{ value: number }> }) => (
+  TimeSeriesChart: (props: {
+    data?: Array<{ value: number }>
+    series?: Array<{ label: string; data: Array<{ value: number }> }>
+  }) => (
     // Values live in an attribute, not text, so text assertions only ever match
     // what the panels themselves render.
-    <div data-testid="chart" data-values={props.data?.map((p) => p.value).join(',')} />
+    <div data-testid="chart" data-values={props.data?.map((p) => p.value).join(',') ?? undefined}>
+      {props.series?.map((s) => (
+        <div
+          key={s.label}
+          data-testid={`chart-series-${s.label}`}
+          data-values={s.data.map((p) => p.value).join(',')}
+        />
+      ))}
+    </div>
   ),
 }))
 
@@ -453,7 +464,8 @@ describe('a panel’s own time window', () => {
   it('gives two panels on one page charts of different spans', async () => {
     // Ten minutes of history: the five-minute panel has dropped the first
     // reading, the fifteen-minute panel still has it. Same series, same page,
-    // different windows.
+    // different windows. Two GPUs, so the following panels chart both together
+    // — GPU 0's line carries the differentiator, GPU 1's is constant.
     vi.useFakeTimers({ shouldAdvanceTime: true })
     const fetchMock = serveConfiguration({ document: storedDocument(gpuPanels()) })
     await openPage(fetchMock)
@@ -464,8 +476,10 @@ describe('a panel’s own time window', () => {
       vi.advanceTimersByTime(2000)
     })
 
+    // Panels tile in document order: the 5m panel's GPU 0 line drops the
+    // ten-minute-old reading; the 15m panel's line still carries it.
     const spans = screen
-      .getAllByTestId('chart')
+      .getAllByTestId('chart-series-GPU 0')
       .map((chart) => chart.getAttribute('data-values'))
 
     expect(spans).toEqual(['22', '11,22'])

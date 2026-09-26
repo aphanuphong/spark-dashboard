@@ -17,8 +17,19 @@ import type { EngineMetrics, EngineSnapshot, GpuMetrics, MetricsSnapshot } from 
 // for changing it ships later (#84/#85) and the machinery has to be right
 // first.
 vi.mock('@/components/charts/TimeSeriesChart', () => ({
-  TimeSeriesChart: (props: { data?: Array<{ value: number }> }) => (
-    <div data-testid="chart" data-values={props.data?.map((p) => p.value).join(',')} />
+  TimeSeriesChart: (props: {
+    data?: Array<{ value: number }>
+    series?: Array<{ label: string; data: Array<{ value: number }> }>
+  }) => (
+    <div data-testid="chart" data-values={props.data?.map((p) => p.value).join(',')}>
+      {props.series?.map((s) => (
+        <div
+          key={s.label}
+          data-testid={`chart-series-${s.label}`}
+          data-values={s.data.map((p) => p.value).join(',')}
+        />
+      ))}
+    </div>
   ),
 }))
 
@@ -62,8 +73,7 @@ function makeEngine(endpoint: string, tokensPerSec: number): EngineSnapshot {
   }
 }
 
-function snapshot(): MetricsSnapshot {
-  const gpus = [makeGpu(0, 11), makeGpu(1, 77)]
+function snapshot(gpus: GpuMetrics[]): MetricsSnapshot {
   return {
     timestamp_ms: 1000,
     gpu: gpus[0],
@@ -115,20 +125,25 @@ function SelectEngine({ endpoint }: { endpoint: string }) {
   )
 }
 
-function Ingest() {
+function Ingest({ gpus }: { gpus: GpuMetrics[] }) {
   const store = useMetricsStore()
   useEffect(() => {
-    store.ingest(snapshot())
-  }, [store])
+    store.ingest(snapshot(gpus))
+  }, [store, gpus])
   return null
 }
 
-function Page() {
+/** The host's GPUs: one, like the DGX Spark or any mirrored single-GPU peer,
+ *  or two, like archml. Selections always name GPU 1 so the same clicks work
+ *  on both. */
+function Page({ gpus = 'single' }: { gpus?: 'single' | 'dual' }) {
+  const host = gpus === 'dual' ? [makeGpu(0, 11), makeGpu(1, 77)] : [makeGpu(0, 11)]
   return (
     <MetricsStoreProvider>
-      <Ingest />
+      <Ingest gpus={host} />
       <PageSelectionProvider>
         <SelectGpu index={1} />
+        <SelectGpu index={0} />
         <SelectGpu index={null} />
         <SelectEngine endpoint={BETA} />
         <GridPanel panel={panel('util', 'gpu-utilization')} />
@@ -159,24 +174,46 @@ function click(name: string) {
 }
 
 describe('the page-level GPU selection', () => {
-  it('starts on the primary GPU, moves every following panel together, and leaves pins alone', () => {
+  it('follows the page\u2019s GPU selection on a single-GPU host, and leaves pins alone', () => {
     render(<Page />)
 
-    // Nothing chosen: the page follows the host's primary GPU.
+    // Nothing chosen: the page follows the host's primary GPU — one gauge and
+    // one line, the pre-grid rendering, untouched by the aggregate view.
     expect(within(region('GPU Utilization')).getByText('11')).toBeInTheDocument()
     expect(within(region('GPU Temp')).getByText('40')).toBeInTheDocument()
 
-    click('Select GPU 1')
+    click('Select GPU 0')
 
-    // One selection change, and every following panel moved with it — value and
-    // chart series, so no panel is showing another GPU's numbers.
+    // The selection names the host's only GPU; the following panels land on it
+    // and the pinned panel — pinned to that same GPU — is unmoved.
+    expect(within(region('GPU Utilization')).getByText('11')).toBeInTheDocument()
+    expect(within(region('GPU Temp')).getByText('40')).toBeInTheDocument()
+    expect(within(region('Pinned to GPU 0')).getByText('11')).toBeInTheDocument()
+
+    // A selection that names a GPU the host does not have is reported, never
+    // silently resolved against the only GPU that is there.
+    click('Select GPU 1')
+    expect(within(region('GPU Utilization')).getByText('GPU 1 is not on this host.')).toBeInTheDocument()
+  })
+
+  it('shows every GPU together on a multi-GPU host, and leaves pins alone', () => {
+    render(<Page gpus="dual" />)
+
+    // A following panel on a two-GPU machine shows all of the host's GPUs at
+    // once — two gauges and a line per GPU — because "the GPU panel" on such a
+    // box has no single GPU to mean.
     const util = region('GPU Utilization')
+    expect(within(util).getByText('11')).toBeInTheDocument()
     expect(within(util).getByText('77')).toBeInTheDocument()
-    expect(within(util).getByTestId('chart')).toHaveAttribute('data-values', '77')
+    expect(within(util).getByTestId('chart-series-GPU 0')).toHaveAttribute('data-values', '11')
+    expect(within(util).getByTestId('chart-series-GPU 1')).toHaveAttribute('data-values', '77')
     expect(within(region('GPU Temp')).getByText('41')).toBeInTheDocument()
 
-    // The pinned panel stayed where it was pinned.
+    // A pin is still an explicit ask: it keeps showing exactly the GPU it was
+    // pinned to while the aggregate panels carry the whole machine.
+    click('Select GPU 1')
     expect(within(region('Pinned to GPU 0')).getByText('11')).toBeInTheDocument()
+    expect(within(region('GPU Utilization')).getByText('77')).toBeInTheDocument()
 
     click('Select GPU default')
     expect(within(region('GPU Utilization')).getByText('11')).toBeInTheDocument()
@@ -190,7 +227,7 @@ describe('a page configured for all models', () => {
         {/* The log stream store, because choosing one engine resolves the log
             panel to a real stream — exactly what the yield-to-choice spec does. */}
         <LogStreamProvider>
-          <Ingest />
+          <Ingest gpus={[makeGpu(0, 11), makeGpu(1, 77)]} />
           <PageSelectionProvider source={{ kind: 'all' }}>
             <SelectEngine endpoint={ALPHA} />
             <GridPanel panel={panel('decode', 'engine-decode-throughput')} />
