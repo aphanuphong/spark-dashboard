@@ -27,12 +27,13 @@ export function GpuUtilizationPanel({ panel }: PanelContentProps) {
     return (
       <MultiGpuPanelBody
         device={gpuPanelDevice(aggregate.gpus.map((g) => g.gpu), resolution)}
-        entries={aggregate.gpus.map(({ gpu }) => {
+        entries={aggregate.gpus.map(({ gpu }, i) => {
           const value = gpu.utilization_percent ?? 0
           const label = `GPU ${gpuIndexOf(gpu)}`
+          const color = gpuSeriesColor(i)
           return {
-            compact: <HBar value={value} label={label} unit="%" />,
-            gauge: (sizePx) => <ArcGauge value={value} label={label} unit="%" size={sizePx} />,
+            compact: <HBar value={value} label={label} unit="%" color={color} />,
+            gauge: (sizePx) => <ArcGauge value={value} label={label} unit="%" color={color} size={sizePx} />,
           }
         })}
         chart={

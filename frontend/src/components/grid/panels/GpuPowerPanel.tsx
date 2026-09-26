@@ -53,13 +53,14 @@ export function GpuPowerPanel({ panel }: PanelContentProps) {
             aggregate.perGpu[i],
             `GPU ${gpuIndexOf(gpu)}`,
           )
+          const color = gpuSeriesColor(i)
           return {
             compact: (
               <HBar
                 value={percent}
                 label={label}
                 unit="W"
-                thresholds={THRESHOLDS.gpuPower}
+                color={color}
                 displayValue={display}
               />
             ),
@@ -68,7 +69,7 @@ export function GpuPowerPanel({ panel }: PanelContentProps) {
                 value={percent}
                 label={label}
                 unit="W"
-                thresholds={THRESHOLDS.gpuPower}
+                color={color}
                 displayValue={display}
                 size={sizePx}
               />

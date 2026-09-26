@@ -27,19 +27,14 @@ export function GpuTemperaturePanel({ panel }: PanelContentProps) {
     return (
       <MultiGpuPanelBody
         device={gpuPanelDevice(aggregate.gpus.map((g) => g.gpu), resolution)}
-        entries={aggregate.gpus.map(({ gpu }) => {
+        entries={aggregate.gpus.map(({ gpu }, i) => {
           const value = gpu.temperature_celsius ?? 0
           const label = `GPU ${gpuIndexOf(gpu)}`
+          const color = gpuSeriesColor(i)
           return {
-            compact: <HBar value={value} label={label} unit="°C" thresholds={THRESHOLDS.gpuTemp} />,
+            compact: <HBar value={value} label={label} unit="°C" color={color} />,
             gauge: (sizePx: number) => (
-              <ArcGauge
-                value={value}
-                label={label}
-                unit="°C"
-                thresholds={THRESHOLDS.gpuTemp}
-                size={sizePx}
-              />
+              <ArcGauge value={value} label={label} unit="°C" color={color} size={sizePx} />
             ),
           }
         })}

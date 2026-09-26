@@ -8,6 +8,9 @@ interface HBarProps {
   label: string
   unit: string
   thresholds?: { warning: number; critical: number }
+  /** Fill color; overrides the threshold coloring. See `ArcGauge.color` — the
+   *  compact sibling draws the same identity mapping. */
+  color?: string
   /** Override the displayed number (e.g. show watts instead of percentage). */
   displayValue?: number
   /** When provided, renders a stacked multi-segment bar with a legend. */
@@ -26,6 +29,7 @@ export const HBar = React.memo(function HBar({
   label,
   unit,
   thresholds,
+  color,
   displayValue,
   segments,
 }: HBarProps) {
@@ -69,13 +73,14 @@ export const HBar = React.memo(function HBar({
           (() => {
             const v = value ?? 0
             const percent = Math.min(Math.max(v / max, 0), 1) * 100
-            const color = thresholds
-              ? thresholdColor(v, thresholds.warning, thresholds.critical)
-              : NVIDIA_THEME.accent
+            const fillColor = color
+              ?? (thresholds
+                ? thresholdColor(v, thresholds.warning, thresholds.critical)
+                : NVIDIA_THEME.accent)
             return (
               <div
                 className="h-full transition-all duration-500"
-                style={{ width: `${percent}%`, backgroundColor: color }}
+                style={{ width: `${percent}%`, backgroundColor: fillColor }}
                 data-testid="hbar-fill"
               />
             )

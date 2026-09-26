@@ -16,6 +16,13 @@ interface ArcGaugeProps {
   thresholds?: { warning: number; critical: number }
   /** Rendered size — number (px) or any CSS length (`"clamp(56px, 6vw, 96px)"`). */
   size?: number | string
+  /**
+   * Fill color for the single-value arc. Overrides the threshold coloring and
+   * the accent color: a panel that draws several GPUs together hands each
+   * gauge the same identity colour as its chart line, so "the cyan gauge is
+   * the cyan line" is the whole mapping. Omit for the threshold-aware default.
+   */
+  color?: string
   /** Override the displayed number in the gauge center (e.g. show watts instead of percentage) */
   displayValue?: number
   /** When provided, renders a multi-segment arc with a color legend instead of a single-value arc. */
@@ -32,6 +39,7 @@ export const ArcGauge = React.memo(function ArcGauge({
   unit,
   thresholds,
   size = 160,
+  color,
   displayValue,
   segments,
 }: ArcGaugeProps) {
@@ -121,16 +129,17 @@ export const ArcGauge = React.memo(function ArcGauge({
             const v = value ?? 0
             const percent = Math.min(Math.max(v / max, 0), 1)
             const offset = arc - percent * arc
-            const color = thresholds
-              ? thresholdColor(v, thresholds.warning, thresholds.critical)
-              : NVIDIA_THEME.accent
+            const strokeColor = color
+              ?? (thresholds
+                ? thresholdColor(v, thresholds.warning, thresholds.critical)
+                : NVIDIA_THEME.accent)
             return (
               <circle
                 cx={cx}
                 cy={cy}
                 r={radius}
                 fill="none"
-                stroke={color}
+                stroke={strokeColor}
                 strokeWidth={strokeWidth}
                 strokeDasharray={`${arc} ${circumference}`}
                 strokeDashoffset={offset}
