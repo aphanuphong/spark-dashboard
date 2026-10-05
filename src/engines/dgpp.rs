@@ -15,10 +15,15 @@
 //!   histogram — see `avg_slots_from_histogram`).
 //! * `pool_blocks_in_use` / `pool_blocks_total` — KV-cache pool utilization.
 //! * `prefix_cache.hits` / `misses` — prefix-cache hit rate; the paired
-//!   `ttft_hit_*` / `ttft_miss_*` lifetime counters drive a windowed TTFT
-//!   (mean over the observations since the previous poll — blank while the
-//!   engine is idle, like the vLLM card), falling back to cumulative
+//!   `ttft_hit_*` / `ttft_miss_*` lifetime counters drive a since-baseline
+//!   mean TTFT (window from dashboard attach / warmup transition, persisting
+//!   across idle polls like the vLLM card), falling back to cumulative
 //!   `prefill_ms / prompts_prefilled` when no TTFT breakdown is exported.
+//! * `latency.queue_time_ms_{sum,count}` and
+//!   `latency.inter_token_latency_ms_{sum,count}` — cumulative queue-wait /
+//!   inter-token-gap accounting (newer dgpp-serve); drive the QUEUE and ITL
+//!   tiles with the same since-baseline semantics. Older engines without the
+//!   section leave both tiles blank.
 //! * `spec_decode.num_{drafts,draft_tokens,accepted_tokens}_total` — the
 //!   same speculative-decoding fields vLLM feeds, so the frontend renders
 //!   both engines identically.
@@ -105,6 +110,24 @@ struct DgppMetrics {
     service: DgppService,
     #[serde(default)]
     prefix_cache: DgppPrefixCache,
+    /// Cumulative queue-wait / inter-token-gap accounting (newer dgpp-serve).
+    #[serde(default)]
+    latency: DgppLatency,
+}
+
+/// `latency`: cumulative (sum_ms, count) pairs for queue wait and
+/// inter-token gaps. All fields optional — engines that omit the whole
+/// section leave both tiles blank.
+#[derive(Deserialize, Default)]
+struct DgppLatency {
+    #[serde(default)]
+    queue_time_ms_sum: Option<f64>,
+    #[serde(default)]
+    queue_time_ms_count: Option<f64>,
+    #[serde(default)]
+    inter_token_latency_ms_sum: Option<f64>,
+    #[serde(default)]
+    inter_token_latency_ms_count: Option<f64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -197,9 +220,9 @@ struct DgppPrefixCache {
     ttft_miss_ms_avg: Option<f64>,
 }
 
-/// TTFT counter snapshot from the previous poll, per outcome (hit, miss).
-/// The engine exports lifetime (count, average) pairs; both sides are stored
-/// raw so the windowed delta can difference the recovered sums.
+/// TTFT counter snapshot per outcome (hit, miss). The engine exports
+/// lifetime (count, average) pairs; both sides are stored raw so the
+/// since-baseline delta can difference the recovered sums.
 #[derive(Clone, Copy, Default)]
 struct DgppTtftSnapshot {
     hit_count: Option<f64>,
@@ -208,49 +231,94 @@ struct DgppTtftSnapshot {
     miss_ms_avg: Option<f64>,
 }
 
-/// Windowed mean TTFT (ms): per-outcome deltas of the lifetime TTFT counters.
-/// DGPP exports lifetime (count, average) per outcome; the product recovers
-/// the lifetime sum, so differencing pairs across polls yields the same
-/// Δsum/Δcount the vLLM card gets from its native histograms (exact up to
-/// the exporter's 3-decimal average rounding). Returns `None` — a blank
-/// tile — when the poll saw no new TTFT observations (idle engine, matching
-/// the vLLM card), when a counter went backwards (engine restart; the next
-/// poll re-baselines), or before the second poll after attach.
-fn windowed_ttft_ms(pc: &DgppPrefixCache, prev: DgppTtftSnapshot) -> Option<f64> {
-    /// One outcome's (Δcount, Δms), or `None` when that outcome's counters
-    /// went backwards. An outcome that is not exported (or not yet
-    /// observed) contributes a zero delta rather than voiding the window.
-    fn outcome_delta(
-        cur: (Option<f64>, Option<f64>),
-        prev: (Option<f64>, Option<f64>),
-    ) -> Option<(f64, f64)> {
-        let (Some(cn), Some(ca)) = cur else {
-            return Some((0.0, 0.0));
-        };
-        if cn < 0.0 || ca < 0.0 {
-            return None;
+/// (count, sum_ms) for one TTFT outcome, or `None` when that outcome's
+/// fields are inconsistently exported. A fully absent outcome contributes
+/// nothing rather than failing the pair.
+fn ttft_outcome(count: Option<f64>, avg: Option<f64>) -> Option<(f64, f64)> {
+    match (count, avg) {
+        (Some(n), Some(a)) if n >= 0.0 && a >= 0.0 => Some((n, n * a)),
+        (None, None) => Some((0.0, 0.0)),
+        _ => None,
+    }
+}
+
+impl DgppTtftSnapshot {
+    /// (total count, total sum_ms) across both outcomes, or `None` when
+    /// either outcome's export is inconsistent.
+    fn totals(&self) -> Option<(f64, f64)> {
+        let (hn, hs) = ttft_outcome(self.hit_count, self.hit_ms_avg)?;
+        let (mn, ms) = ttft_outcome(self.miss_count, self.miss_ms_avg)?;
+        Some((hn + mn, hs + ms))
+    }
+}
+
+/// Mean TTFT (ms) over observations since the dashboard's baseline — the
+/// same window the vLLM card uses (attach / warmup transition), so the
+/// tile fills on the first post-attach request and **persists** across
+/// idle polls instead of flashing for one poll. Sums are recovered from
+/// the lifetime (count, average) exports (exact up to the exporter's
+/// 3-decimal average rounding). Returns `None` while no new observation
+/// has arrived since the baseline, and re-baselines when the counters go
+/// backwards (engine restart).
+fn baseline_ttft_ms(pc: &DgppPrefixCache, base: &mut Option<DgppTtftSnapshot>) -> Option<f64> {
+    let cur = DgppTtftSnapshot {
+        hit_count: pc.ttft_hit_count,
+        hit_ms_avg: pc.ttft_hit_ms_avg,
+        miss_count: pc.ttft_miss_count,
+        miss_ms_avg: pc.ttft_miss_ms_avg,
+    };
+    let (cn, cs) = cur.totals()?;
+    match base {
+        None => {
+            *base = Some(cur);
+            None
         }
-        let sum = cn * ca;
-        match (prev.0, prev.1) {
-            (Some(pn), Some(pa)) if pn >= 0.0 && pa >= 0.0 => {
-                let psum = pn * pa;
-                (cn >= pn && sum >= psum).then_some((cn - pn, sum - psum))
+        Some(b) => {
+            let (bn, bs) = b.totals()?;
+            if cn < bn {
+                *base = Some(cur); // engine restart: re-baseline
+                return None;
             }
-            (None, None) => Some((0.0, 0.0)), // first poll for this outcome
-            _ => None,                        // inconsistent snapshot → void
+            let dn = cn - bn;
+            if dn == 0.0 {
+                return None; // no observations since the baseline yet
+            }
+            // A recovered-sum regression without a count regression is
+            // 3-decimal rounding noise at a mean-rounding boundary — blank
+            // this poll but keep the baseline.
+            (cs >= bs).then(|| (cs - bs) / dn)
         }
     }
+}
 
-    let (hn, hm) = outcome_delta(
-        (pc.ttft_hit_count, pc.ttft_hit_ms_avg),
-        (prev.hit_count, prev.hit_ms_avg),
-    )?;
-    let (mn, mm) = outcome_delta(
-        (pc.ttft_miss_count, pc.ttft_miss_ms_avg),
-        (prev.miss_count, prev.miss_ms_avg),
-    )?;
-    let total = hn + mn;
-    (total > 0.0).then(|| (hm + mm) / total)
+/// Mean latency (ms) from a cumulative (sum_ms, count) counter pair over
+/// the window since the dashboard's baseline — persists across idle polls
+/// like the vLLM histogram tiles, blanks until the first post-attach
+/// observation, and re-baselines when the counters go backwards. `cur` is
+/// `None` when the engine does not export the counter (tile stays blank
+/// without disturbing the stored baseline).
+fn baseline_pair_ms(cur: Option<(f64, f64)>, base: &mut Option<(f64, f64)>) -> Option<f64> {
+    let (cs, cc) = cur?;
+    if cs < 0.0 || cc <= 0.0 {
+        return None;
+    }
+    match base {
+        None => {
+            *base = Some((cs, cc));
+            None
+        }
+        Some((bs, bc)) => {
+            if cc < *bc {
+                *base = Some((cs, cc)); // engine restart: re-baseline
+                return None;
+            }
+            let dn = cc - *bc;
+            if dn == 0.0 {
+                return None; // no observations since the baseline yet
+            }
+            (cs >= *bs).then(|| (cs - *bs) / dn)
+        }
+    }
 }
 
 /// Fallback mean TTFT (ms) for engines that do not expose the per-outcome
@@ -277,7 +345,7 @@ struct DgppCounterSnapshot {
 
 /// Everything derived across polls: previous counter readings, running
 /// averages, the previous spec-decode pair for the live acceptance rate, and
-/// the previous TTFT counts for the windowed TTFT.
+/// the since-baseline windows for the TTFT / queue / ITL means.
 #[derive(Default)]
 struct DgppPollState {
     prev_counters: Option<DgppCounterSnapshot>,
@@ -287,8 +355,14 @@ struct DgppPollState {
     avg_prompt_accum: (f64, u64),
     /// Previous (accepted, draft) spec-decode counters for the live TAR.
     prev_spec: Option<(f64, f64)>,
-    /// Previous TTFT observation counters for the windowed TTFT.
-    prev_ttft: DgppTtftSnapshot,
+    /// TTFT baseline captured on the first post-attach / post-warmup poll;
+    /// re-captured when the engine restarts. The mean-TTFT window runs from
+    /// this baseline and persists across idle polls (vLLM-card semantics).
+    ttft_base: Option<DgppTtftSnapshot>,
+    /// Queue-wait (sum_ms, count) baseline — same semantics as `ttft_base`.
+    queue_base: Option<(f64, f64)>,
+    /// Inter-token-gap (sum_ms, count) baseline — same semantics.
+    itl_base: Option<(f64, f64)>,
 }
 
 /// Warmup gate: blanks averaged/derived metrics until the engine has served
@@ -337,7 +411,9 @@ fn compute_metrics(
         state.avg_gen_accum = (0.0, 0);
         state.avg_prompt_accum = (0.0, 0);
         state.prev_spec = None;
-        state.prev_ttft = DgppTtftSnapshot::default();
+        state.ttft_base = None;
+        state.queue_base = None;
+        state.itl_base = None;
     }
 
     let scheduler = &body.scheduler;
@@ -516,27 +592,44 @@ fn compute_metrics(
     let blank = warming_up;
 
     // --- TTFT ---
-    // Windowed mean TTFT: the engine exports lifetime hit/miss averages, so
-    // the tile shows the mean over TTFT observations since the previous
-    // poll — blank while idle — matching the vLLM card's histogram-delta
-    // semantics. Engines that do not export the breakdown fall back to
-    // cumulative prefill time over prefilled prompts. The snapshot is
-    // stored every poll (the warmup→active transition resets it) so each
-    // window diffs against the immediately preceding poll.
+    // Since-baseline mean TTFT: the engine exports lifetime hit/miss
+    // averages, so the tile shows the mean over TTFT observations since the
+    // dashboard's baseline (attach / warmup transition) — it fills on the
+    // first post-attach request and persists across idle polls, exactly the
+    // vLLM card's window semantics. Engines that do not export the breakdown
+    // fall back to cumulative prefill time over prefilled prompts.
     let has_ttft_stats = body.prefix_cache.ttft_hit_count.is_some()
         || body.prefix_cache.ttft_miss_count.is_some();
     let ttft_ms = if blank {
         None
     } else if has_ttft_stats {
-        windowed_ttft_ms(&body.prefix_cache, state.prev_ttft)
+        baseline_ttft_ms(&body.prefix_cache, &mut state.ttft_base)
     } else {
         fallback_ttft_ms(&body.scheduler)
     };
-    state.prev_ttft = DgppTtftSnapshot {
-        hit_count: body.prefix_cache.ttft_hit_count,
-        hit_ms_avg: body.prefix_cache.ttft_hit_ms_avg,
-        miss_count: body.prefix_cache.ttft_miss_count,
-        miss_ms_avg: body.prefix_cache.ttft_miss_ms_avg,
+
+    // QUEUE / ITL tiles: since-baseline means over the engine's cumulative
+    // `latency` counters (sum_ms + count). Older dgpp-serve without the
+    // section leaves both tiles blank — honest absence, no fabricated data.
+    let queue_time_ms = if blank {
+        None
+    } else {
+        baseline_pair_ms(
+            body.latency
+                .queue_time_ms_sum
+                .zip(body.latency.queue_time_ms_count),
+            &mut state.queue_base,
+        )
+    };
+    let inter_token_latency_ms = if blank {
+        None
+    } else {
+        baseline_pair_ms(
+            body.latency
+                .inter_token_latency_ms_sum
+                .zip(body.latency.inter_token_latency_ms_count),
+            &mut state.itl_base,
+        )
     };
 
     EngineMetrics {
@@ -561,6 +654,8 @@ fn compute_metrics(
         // histogram, falling back to decode_rows/decode_steps). Matches the
         // vLLM tile's mean iteration tokens (requests per engine step).
         avg_batch_size: if blank { None } else { avg_slots },
+        queue_time_ms,
+        inter_token_latency_ms,
         spec_decode_draft_tokens_total,
         spec_decode_accepted_tokens_total,
         spec_decode_drafts_total,
@@ -774,6 +869,11 @@ mod tests {
                 "ttft_hit_count": 62, "ttft_hit_ms_avg": 27672.931,
                 "ttft_miss_count": 105, "ttft_miss_ms_avg": 137882.263
               },
+              "latency": {
+                "queue_time_ms_sum": 4800.0, "queue_time_ms_count": 160,
+                "inter_token_latency_ms_sum": 98765.4,
+                "inter_token_latency_ms_count": 400000
+              },
               "prefill": {"requests": [], "prompt_tokens": 0}
             }"#,
         )
@@ -803,60 +903,77 @@ mod tests {
     }
 
     #[test]
-    fn windowed_ttft_weights_both_outcomes() {
+    fn baseline_ttft_weights_both_outcomes() {
         let pc = live_fixture().prefix_cache;
-        let prev = DgppTtftSnapshot {
+        let mut base = Some(DgppTtftSnapshot {
             hit_count: Some(60.0),
             hit_ms_avg: Some(27_672.931),
             miss_count: Some(103.0),
             miss_ms_avg: Some(137_882.263),
-        };
+        });
         // 2 new hits and 2 new misses, each entering at its outcome's
         // current lifetime average (sum differencing with unchanged avg).
         let expected = (2.0 * 27_672.931 + 2.0 * 137_882.263) / 4.0;
-        let got = windowed_ttft_ms(&pc, prev).expect("new observations");
+        let got = baseline_ttft_ms(&pc, &mut base).expect("new observations");
         assert!((got - expected).abs() < 1e-6, "got {got}, want {expected}");
+        // The baseline stays fixed: the window runs from the baseline, not
+        // from the previous poll.
+        let (bn, _) = base.expect("baseline kept").totals().expect("consistent");
+        assert_eq!(bn, 163.0);
     }
 
     #[test]
-    fn windowed_ttft_blank_without_new_observations() {
+    fn baseline_ttft_attach_idle_restart() {
         let pc = live_fixture().prefix_cache;
-        // Idle engine: counts unchanged since the previous poll.
-        let idle = DgppTtftSnapshot {
-            hit_count: pc.ttft_hit_count,
-            hit_ms_avg: pc.ttft_hit_ms_avg,
-            miss_count: pc.ttft_miss_count,
-            miss_ms_avg: pc.ttft_miss_ms_avg,
-        };
-        assert_eq!(windowed_ttft_ms(&pc, idle), None, "idle → blank tile");
 
-        // First poll after attach: nothing recorded yet.
-        assert_eq!(windowed_ttft_ms(&pc, DgppTtftSnapshot::default()), None);
+        // Attach: the baseline is captured and the tile stays blank.
+        let mut base = None;
+        assert_eq!(baseline_ttft_ms(&pc, &mut base), None, "attach → blank");
+        assert!(base.is_some(), "baseline captured on attach");
 
-        // Counters going backwards (engine restart) yield None too.
-        let restarted = DgppTtftSnapshot {
-            hit_count: Some(100.0),
-            hit_ms_avg: Some(1.0),
-            miss_count: Some(200.0),
-            miss_ms_avg: Some(1.0),
-        };
-        assert_eq!(windowed_ttft_ms(&pc, restarted), None);
+        // A baseline older than the current counters: the window mean
+        // covers everything observed since that baseline.
+        base = Some(DgppTtftSnapshot {
+            hit_count: Some(60.0),
+            hit_ms_avg: Some(27_672.931),
+            miss_count: Some(102.0),
+            miss_ms_avg: Some(137_882.263),
+        });
+        let expected = (2.0 * 27_672.931 + 3.0 * 137_882.263) / 5.0;
+        let got = baseline_ttft_ms(&pc, &mut base).expect("window mean");
+
+        // Idle poll: same window, same value — the tile persists instead of
+        // blanking (the vLLM-card semantics this mirrors).
+        let again = baseline_ttft_ms(&pc, &mut base).expect("persists while idle");
+        assert!((again - got).abs() < 1e-9);
+
+        // Engine restart: counters collapse → re-baseline, blank tile.
+        let mut restarted = live_fixture().prefix_cache;
+        restarted.ttft_hit_count = Some(1.0);
+        restarted.ttft_hit_ms_avg = Some(5.0);
+        restarted.ttft_miss_count = None;
+        restarted.ttft_miss_ms_avg = None;
+        assert_eq!(
+            baseline_ttft_ms(&restarted, &mut base),
+            None,
+            "restart → blank"
+        );
     }
 
     #[test]
-    fn windowed_ttft_one_sided_window() {
+    fn baseline_ttft_one_sided_window() {
         // Only the miss side advanced: the window mean is that outcome's
         // current lifetime average.
         let pc = live_fixture().prefix_cache;
-        let prev = DgppTtftSnapshot {
+        let mut base = Some(DgppTtftSnapshot {
             hit_count: pc.ttft_hit_count,
             hit_ms_avg: pc.ttft_hit_ms_avg,
             miss_count: Some(105.0 - 2.0),
             miss_ms_avg: pc.ttft_miss_ms_avg,
-        };
+        });
         // Delta sum carries ~1e-9 relative float error from count×avg
         // products, so compare with tolerance.
-        let got = windowed_ttft_ms(&pc, prev).expect("miss-only window");
+        let got = baseline_ttft_ms(&pc, &mut base).expect("miss-only window");
         assert!((got - 137_882.263).abs() < 1e-6, "got {got}");
     }
 
@@ -876,12 +993,12 @@ mod tests {
     }
 
     #[test]
-    fn ttft_is_windowed_across_polls() {
+    fn ttft_is_since_baseline_across_polls() {
         let body = live_fixture();
         let t0 = Instant::now();
         let mut state = DgppPollState::default();
         let first = compute_metrics(&body, &mut state, false, false, t0);
-        assert_eq!(first.ttft_ms, None, "first poll has no window");
+        assert_eq!(first.ttft_ms, None, "attach poll captures the baseline");
 
         // One more hit and one more miss one poll later: the window mean is
         // the pair of current lifetime averages.
@@ -892,6 +1009,11 @@ mod tests {
         let expected = (27_672.931 + 137_882.263) / 2.0;
         let got = m.ttft_ms.expect("windowed ttft");
         assert!((got - expected).abs() < 1e-6, "got {got}, want {expected}");
+
+        // Idle poll afterwards: unchanged counters still sit ahead of the
+        // attach baseline, so the same mean persists instead of blanking.
+        let idle = compute_metrics(&grown, &mut state, false, false, t0 + Duration::from_secs(4));
+        assert_eq!(idle.ttft_ms, m.ttft_ms, "persists across idle polls");
     }
 
     #[test]
@@ -904,6 +1026,78 @@ mod tests {
         let mut state = DgppPollState::default();
         let m = compute_metrics(&body, &mut state, false, false, Instant::now());
         assert_eq!(m.ttft_ms, fallback_ttft_ms(&body.scheduler));
+    }
+
+    #[test]
+    fn baseline_pair_windows_persists_and_rebaselines() {
+        let mut base = None;
+
+        // Engine not exporting the counter: blank, baseline untouched.
+        assert_eq!(baseline_pair_ms(None, &mut base), None);
+        assert_eq!(base, None);
+
+        // First poll with observations: baseline captured, tile blank.
+        assert_eq!(baseline_pair_ms(Some((1000.0, 10.0)), &mut base), None);
+        assert_eq!(base, Some((1000.0, 10.0)));
+
+        // More observations: mean over the window since the baseline
+        // (Δsum 3000−1000 = 2000 ms over Δcount 20−10 = 10 → 200 ms).
+        let got = baseline_pair_ms(Some((3000.0, 20.0)), &mut base).expect("mean");
+        assert!((got - 200.0).abs() < 1e-9, "got {got}");
+
+        // Idle poll: the window is unchanged, the value persists.
+        assert_eq!(baseline_pair_ms(Some((3000.0, 20.0)), &mut base), Some(got));
+
+        // Count collapse (engine restart): re-baseline, blank tile.
+        assert_eq!(baseline_pair_ms(Some((5.0, 1.0)), &mut base), None);
+        assert_eq!(base, Some((5.0, 1.0)));
+    }
+
+    #[test]
+    fn queue_and_itl_are_since_baseline_and_persist() {
+        let body = live_fixture();
+        let t0 = Instant::now();
+        let mut state = DgppPollState::default();
+
+        let first = compute_metrics(&body, &mut state, false, false, t0);
+        assert_eq!(first.queue_time_ms, None, "attach captures the baseline");
+        assert_eq!(first.inter_token_latency_ms, None);
+
+        let mut grown = live_fixture();
+        grown.latency.queue_time_ms_sum = Some(6800.0);
+        grown.latency.queue_time_ms_count = Some(170.0);
+        grown.latency.inter_token_latency_ms_sum = Some(198_765.4);
+        grown.latency.inter_token_latency_ms_count = Some(410_000.0);
+        let m = compute_metrics(&grown, &mut state, false, false, t0 + Duration::from_secs(2));
+        assert!(
+            (m.queue_time_ms.unwrap() - 200.0).abs() < 1e-9,
+            "queue Δ2000ms/Δ10 = 200 ms, got {:?}",
+            m.queue_time_ms
+        );
+        assert!(
+            (m.inter_token_latency_ms.unwrap() - 10.0).abs() < 1e-6,
+            "itl Δ100000ms/Δ10000 = 10 ms, got {:?}",
+            m.inter_token_latency_ms
+        );
+
+        // Idle poll: both tiles persist.
+        let idle = compute_metrics(&grown, &mut state, false, false, t0 + Duration::from_secs(4));
+        assert_eq!(idle.queue_time_ms, m.queue_time_ms);
+        assert_eq!(idle.inter_token_latency_ms, m.inter_token_latency_ms);
+    }
+
+    #[test]
+    fn queue_and_itl_blank_without_latency_section() {
+        let mut body = live_fixture();
+        body.latency = DgppLatency::default();
+        let t0 = Instant::now();
+        let mut state = DgppPollState::default();
+        let first = compute_metrics(&body, &mut state, false, false, t0);
+        assert_eq!(first.queue_time_ms, None);
+        assert_eq!(first.inter_token_latency_ms, None);
+        let again = compute_metrics(&body, &mut state, false, false, t0 + Duration::from_secs(2));
+        assert_eq!(again.queue_time_ms, None);
+        assert_eq!(again.inter_token_latency_ms, None);
     }
 
     #[test]
@@ -1056,7 +1250,16 @@ mod tests {
         assert_eq!(m.tokens_per_sec, None, "no rate across the boundary");
         let fresh = state.prev_counters.expect("fresh baseline recorded");
         assert_eq!(fresh.tokens_generated, 411_677.0);
-        assert_eq!(state.prev_ttft.hit_count, Some(62.0), "fresh TTFT baseline");
+        assert_eq!(
+            state.ttft_base.expect("fresh TTFT baseline").hit_count,
+            Some(62.0)
+        );
+        assert_eq!(state.queue_base, Some((4800.0, 160.0)), "fresh QUEUE baseline");
+        assert_eq!(
+            state.itl_base,
+            Some((98765.4, 400000.0)),
+            "fresh ITL baseline"
+        );
         assert_eq!(state.avg_gen_accum, (0.0, 0));
         assert!(state.prev_spec.is_some(), "fresh spec pair recorded");
 
