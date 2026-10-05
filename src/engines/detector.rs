@@ -27,12 +27,22 @@ pub struct DetectedEngine {
 }
 
 /// Known engine binaries and their default ports.
-const ENGINE_BINARIES: &[(&str, EngineType, &str)] =
-    &[("vllm", EngineType::Vllm, "http://localhost:8000")];
+const ENGINE_BINARIES: &[(&str, EngineType, &str)] = &[
+    ("vllm", EngineType::Vllm, "http://localhost:8000"),
+    ("dgpp-serve", EngineType::Dgpp, "http://localhost:18080"),
+];
 
-/// The port vLLM serves on when it is not told otherwise. Used wherever a
-/// candidate is found but its port cannot be read off the command line.
-const VLLM_DEFAULT_PORT: u16 = 8000;
+/// The port an engine serves on when it is not told otherwise. Used wherever
+/// a candidate is found but its port cannot be read off the command line or
+/// the container config.
+fn default_port(engine_type: &EngineType) -> u16 {
+    match engine_type {
+        EngineType::Vllm => 8000,
+        EngineType::Dgpp => 18080,
+        // `auto` exists only as a manual override; it is never detected.
+        EngineType::Auto => 8000,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public detection entry point
@@ -124,23 +134,41 @@ fn is_vllm_process(command: &str) -> bool {
         .any(|arg| arg == "vllm" || arg.ends_with("/vllm") || arg.contains("vllm.entrypoints"))
 }
 
-/// The endpoint to probe a container's vLLM on, and whether the port had to be
-/// assumed.
+/// Whether a process command line is a `dgpp-serve` server rather than
+/// something that merely mentions it. The binary name is the only signal —
+/// DGPP has no Python entrypoint module — so this accepts any launch form
+/// (`dgpp-serve ...`, `/usr/local/bin/dgpp-serve ...`, `./dgpp-serve ...`).
+fn is_dgpp_process(command: &str) -> bool {
+    command.split_whitespace().any(|arg| arg.contains("dgpp-serve"))
+}
+
+/// Whether a command-line argument belongs to the given engine binary —
+/// either the binary itself or (for vLLM) its Python entrypoint module.
+fn arg_belongs_to(binary: &str, arg: &str) -> bool {
+    match binary {
+        "vllm" => arg.contains("vllm.entrypoints") || arg.ends_with("/vllm") || arg == "vllm",
+        "dgpp-serve" => arg.contains("dgpp-serve"),
+        _ => arg == binary || arg.ends_with(&format!("/{binary}")),
+    }
+}
+
+/// The endpoint to probe a container's engine on, and whether the port had
+/// to be assumed.///
+/// No port anywhere — no published binding, no `--port` in the command, none
+/// in the container's process list — means the engine is on its own default
+/// ([`default_port`]). That is the normal shape of a host-networked
+/// container: it publishes nothing, because it is already on the host's
+/// ports.
 ///
-/// No port anywhere — no published binding, no `--port` in the command, none in
-/// the container's process list — means vLLM is on its own default. That is the
-/// normal shape of a host-networked container: it publishes nothing, because it
-/// is already on the host's ports.
-///
-/// Assuming is safe and dropping the container is not. The health probe rejects
-/// a candidate whose `/health` does not answer, so a wrong assumption costs one
-/// request and corrects itself — while a container dropped for having no
-/// readable port is invisible to the dashboard for good, engine, metrics and
-/// logs alike.
-fn docker_endpoint(port: Option<&str>) -> (String, bool) {
+/// Assuming is safe and dropping the container is not. The health probe
+/// rejects a candidate whose `/health` does not answer, so a wrong assumption
+/// costs one request and corrects itself — while a container dropped for
+/// having no readable port is invisible to the dashboard for good, engine,
+/// metrics and logs alike.
+fn docker_endpoint(engine_type: &EngineType, port: Option<&str>) -> (String, bool) {
     match port {
         Some(p) => (format!("http://localhost:{}", p), false),
-        None => (format!("http://localhost:{}", VLLM_DEFAULT_PORT), true),
+        None => (format!("http://localhost:{}", default_port(engine_type)), true),
     }
 }
 
@@ -155,26 +183,21 @@ fn detect_by_process(sys: &sysinfo::System) -> Vec<DetectedEngine> {
         // Direct binary match (e.g. process named "vllm")
         let mut procs: Vec<_> = sys.processes_by_name(OsStr::new(binary)).collect();
 
-        // Also check all processes for vllm in their command-line args.
-        // Covers: `python3 /usr/local/bin/vllm serve ...`  (Docker host-networking)
-        //         `python -m vllm.entrypoints.openai.api_server ...`
+        // Also check all processes for the engine in their command-line
+        // args. Covers: `python3 /usr/local/bin/vllm serve ...`
+        // (Docker host-networking) and
+        //        `python -m vllm.entrypoints.openai.api_server ...`
         if procs.is_empty() {
-            let vllm_procs: Vec<_> = sys
+            let arg_procs: Vec<_> = sys
                 .processes()
                 .values()
                 .filter(|p| {
-                    p.cmd().iter().any(|arg| {
-                        arg.to_str()
-                            .map(|s| {
-                                s.contains("vllm.entrypoints")
-                                    || s.ends_with("/vllm")
-                                    || s == "vllm"
-                            })
-                            .unwrap_or(false)
-                    })
+                    p.cmd()
+                        .iter()
+                        .any(|arg| arg.to_str().map(|s| arg_belongs_to(binary, s)).unwrap_or(false))
                 })
                 .collect();
-            procs = vllm_procs;
+            procs = arg_procs;
         }
 
         // Emit one DetectedEngine per distinct endpoint. Multi-instance native
@@ -289,7 +312,7 @@ fn parse_endpoint_from_args(args: &[OsString], default_endpoint: &str) -> Option
         let h = host.unwrap_or("localhost");
         // Treat 0.0.0.0 as localhost for probing purposes
         let h = if h == "0.0.0.0" { "localhost" } else { h };
-        let p = port.unwrap_or("8000");
+        let p = port.unwrap_or_else(|| default_endpoint.rsplit(':').next().unwrap_or("8000"));
         Some(format!("http://{}:{}", h, p))
     } else {
         Some(default_endpoint.to_string())
@@ -470,15 +493,19 @@ pub async fn detect_docker_engines() -> Vec<DetectedEngine> {
         // private image, started with `sleep infinity` and given vLLM by hand is
         // otherwise invisible to the dashboard entirely, however plainly it is
         // named.
-        let named_vllm = container
+        let named_engine = container
             .names
             .as_deref()
             .unwrap_or_default()
             .iter()
-            .any(|n| n.to_lowercase().contains("vllm"));
+            .any(|n| {
+                let n = n.to_lowercase();
+                n.contains("vllm") || n.contains("dgpp")
+            });
         let is_vllm = image.contains("vllm") || command.contains("vllm");
+        let is_dgpp = image.contains("dgpp") || command.contains("dgpp-serve");
 
-        if !is_vllm && !named_vllm {
+        if !is_vllm && !is_dgpp && !named_engine {
             continue;
         }
 
@@ -504,6 +531,7 @@ pub async fn detect_docker_engines() -> Vec<DetectedEngine> {
         //    *entrypoint* and often omits the child vllm-serve args.
         let mut pids: Vec<u32> = Vec::new();
         let mut saw_vllm_process = false;
+        let mut saw_dgpp_process = false;
         let (port, served_model) = {
             let container_id = container.id.as_deref().unwrap_or_default();
             if container_id.is_empty() {
@@ -522,6 +550,9 @@ pub async fn detect_docker_engines() -> Vec<DetectedEngine> {
                                 let line = row.join(" ");
                                 if is_vllm_process(&line) {
                                     saw_vllm_process = true;
+                                }
+                                if is_dgpp_process(&line) {
+                                    saw_dgpp_process = true;
                                 }
                                 if found_port.is_none() {
                                     if let Some(p) = parse_port_from_command_str(&line) {
@@ -557,11 +588,24 @@ pub async fn detect_docker_engines() -> Vec<DetectedEngine> {
         pids.sort_unstable();
         pids.dedup();
 
+        // Flavor: running processes are the strongest evidence (an image can
+        // be retagged, an entrypoint script can launch either engine);
+        // image/command mentions decide when `docker top` saw neither.
+        let engine_type = if saw_dgpp_process {
+            EngineType::Dgpp
+        } else if saw_vllm_process {
+            EngineType::Vllm
+        } else if is_dgpp {
+            EngineType::Dgpp
+        } else {
+            EngineType::Vllm
+        };
+
         // A container that only matched by name has to prove itself. Nothing
-        // that merely calls itself vllm becomes an engine.
-        if !is_vllm && !saw_vllm_process {
+        // that merely calls itself vLLM or DGPP becomes an engine.
+        if !is_vllm && !is_dgpp && !saw_vllm_process && !saw_dgpp_process {
             tracing::debug!(
-                "Container named like vLLM (image={}) runs no vLLM process; skipping",
+                "Container named like an engine (image={}) runs no engine process; skipping",
                 container.image.as_deref().unwrap_or("?"),
             );
             continue;
@@ -577,16 +621,17 @@ pub async fn detect_docker_engines() -> Vec<DetectedEngine> {
         // wrong guess costs one request and corrects itself, while a container
         // dropped for having no port is invisible to the dashboard for good —
         // engine, metrics and logs alike.
-        let (endpoint, guessed) = docker_endpoint(port.as_deref());
+        let (endpoint, guessed) = docker_endpoint(&engine_type, port.as_deref());
         tracing::debug!(
-            "Docker vLLM candidate: image={}, endpoint={}{}, model={:?}",
+            "Docker engine candidate: image={}, type={}, endpoint={}{}, model={:?}",
             container.image.as_deref().unwrap_or("?"),
+            engine_type,
             endpoint,
             if guessed { " (default port)" } else { "" },
             served_model,
         );
         detected.push(DetectedEngine {
-            engine_type: EngineType::Vllm,
+            engine_type,
             endpoint,
             deployment_mode: DeploymentMode::Docker,
             served_model,
@@ -640,21 +685,19 @@ pub async fn detect_docker_engines() -> Vec<DetectedEngine> {
 // ---------------------------------------------------------------------------
 
 /// Verify that a candidate engine's API is actually responding.
+///
+/// Type-agnostic on purpose: every supported engine (vLLM, DGPP) answers
+/// GET /health with a success status, and the `auto` override sniffs the
+/// metrics flavor only once polling starts — the probe only has to prove
+/// that *an* engine is listening.
 async fn probe_engine(client: &reqwest::Client, candidate: &DetectedEngine) -> bool {
-    let timeout = Duration::from_secs(2);
-
-    match candidate.engine_type {
-        EngineType::Vllm => {
-            // GET /health -- 200 = healthy
-            client
-                .get(format!("{}/health", candidate.endpoint))
-                .timeout(timeout)
-                .send()
-                .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false)
-        }
-    }
+    client
+        .get(format!("{}/health", candidate.endpoint))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -818,21 +861,35 @@ mod tests {
     #[test]
     fn docker_endpoint_uses_the_port_detection_found() {
         assert_eq!(
-            docker_endpoint(Some("8001")),
+            docker_endpoint(&EngineType::Vllm, Some("8001")),
             ("http://localhost:8001".to_string(), false)
         );
     }
 
     #[test]
-    fn docker_endpoint_assumes_vllms_default_when_no_port_is_readable() {
+    fn docker_endpoint_assumes_the_engines_default_when_no_port_is_readable() {
         // The host-networked container: it publishes no ports because it is
         // already on the host's, and it was started without an explicit
         // --port. Before this it was dropped from detection entirely, which
         // took its metrics and its logs with it.
         assert_eq!(
-            docker_endpoint(None),
+            docker_endpoint(&EngineType::Vllm, None),
             ("http://localhost:8000".to_string(), true)
         );
+        assert_eq!(
+            docker_endpoint(&EngineType::Dgpp, None),
+            ("http://localhost:18080".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn a_dgpp_serve_process_is_recognized() {
+        assert!(is_dgpp_process("dgpp-serve --model org/name --port 18080"));
+        assert!(is_dgpp_process(
+            "/usr/local/bin/dgpp-serve --config cluster.json"
+        ));
+        assert!(!is_dgpp_process("tail -f /var/log/dgpp.log"));
+        assert!(!is_dgpp_process("nginx: master process /usr/sbin/nginx"));
     }
 
     #[test]

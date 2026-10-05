@@ -1,5 +1,8 @@
+pub mod auto;
 pub mod detector;
+pub mod dgpp;
 pub mod histogram;
+pub mod metadata;
 pub mod prometheus;
 pub mod vllm;
 pub mod warmup;
@@ -17,6 +20,10 @@ use tokio::sync::RwLock;
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 pub enum EngineType {
     Vllm,
+    Dgpp,
+    /// Endpoint whose engine flavor is sniffed per poll (`--engine auto`):
+    /// follows whichever engine is live at the endpoint as it is swapped.
+    Auto,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
@@ -29,6 +36,8 @@ impl std::fmt::Display for EngineType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EngineType::Vllm => write!(f, "vLLM"),
+            EngineType::Dgpp => write!(f, "DGPP"),
+            EngineType::Auto => write!(f, "Auto"),
         }
     }
 }
@@ -507,6 +516,12 @@ pub fn create_adapter(
         EngineType::Vllm => Box::new(vllm::VllmAdapter::new(
             client, endpoint, model_hint, api_key,
         )),
+        EngineType::Dgpp => Box::new(dgpp::DgppAdapter::new(
+            client, endpoint, model_hint, api_key,
+        )),
+        EngineType::Auto => Box::new(auto::AutoAdapter::new(
+            client, endpoint, model_hint, api_key,
+        )),
     }
 }
 
@@ -597,10 +612,21 @@ pub async fn engine_collector_loop(
 
                 // Add newly detected engines
                 for d in &detected {
-                    let key = (d.engine_type.clone(), d.endpoint.clone());
+                    // An endpoint a manual override claims is monitored by
+                    // that override's adapter, which is authoritative for the
+                    // engine type (an `auto` override follows the live
+                    // flavor). Detection still contributes host facts — PIDs,
+                    // container id, deployment mode — to the override's entry
+                    // instead of creating a duplicate tile for the endpoint.
+                    let key_type = overrides
+                        .iter()
+                        .find(|ov| ov.endpoint == d.endpoint)
+                        .map(|ov| ov.engine_type.clone())
+                        .unwrap_or_else(|| d.engine_type.clone());
+                    let key = (key_type.clone(), d.endpoint.clone());
                     let state = engine_map.entry(key).or_insert_with(|| {
                         let adapter = create_adapter(
-                            d.engine_type.clone(),
+                            key_type.clone(),
                             d.endpoint.clone(),
                             client.clone(),
                             d.served_model.clone(),
@@ -637,7 +663,17 @@ pub async fn engine_collector_loop(
                 // wrong guess. Clear them: empty = unknown = no badge.
                 let detected_keys: std::collections::HashSet<_> = detected
                     .iter()
-                    .map(|d| (d.engine_type.clone(), d.endpoint.clone()))
+                    .map(|d| {
+                        // Same effective-key rule as the insertion above so a
+                        // detection pass cannot look absent for an override
+                        // entry it just enriched.
+                        let t = overrides
+                            .iter()
+                            .find(|ov| ov.endpoint == d.endpoint)
+                            .map(|ov| ov.engine_type.clone())
+                            .unwrap_or_else(|| d.engine_type.clone());
+                        (t, d.endpoint.clone())
+                    })
                     .collect();
                 clear_stale_pids(&mut engine_map, &detected_keys);
             }
@@ -695,8 +731,19 @@ pub async fn engine_collector_loop(
                     }
                 }
 
-                // Remove engines that have exceeded the 30-second grace period
-                engine_map.retain(|_key, state| !state.should_remove());
+                // Remove engines that have exceeded the 30-second grace period.
+                // Manually configured overrides are exempt: their endpoint is
+                // the operator's explicit declaration, so an engine swap that
+                // takes it down for a while must not drop the entry — the
+                // state simply waits for the endpoint to come back up
+                // (possibly serving a different engine flavor, which an
+                // `auto` override then follows).
+                engine_map.retain(|key, state| {
+                    !state.should_remove()
+                        || overrides
+                            .iter()
+                            .any(|ov| ov.engine_type == key.0 && ov.endpoint == key.1)
+                });
 
                 // Write updated snapshots to shared state
                 let mut lock = shared_snapshots.write().await;
