@@ -15,7 +15,10 @@
 //!   histogram — see `avg_slots_from_histogram`).
 //! * `pool_blocks_in_use` / `pool_blocks_total` — KV-cache pool utilization.
 //! * `prefix_cache.hits` / `misses` — prefix-cache hit rate; the paired
-//!   `ttft_hit_*` / `ttft_miss_*` averages blend into an overall mean TTFT.
+//!   `ttft_hit_*` / `ttft_miss_*` lifetime counters drive a windowed TTFT
+//!   (mean over the observations since the previous poll — blank while the
+//!   engine is idle, like the vLLM card), falling back to cumulative
+//!   `prefill_ms / prompts_prefilled` when no TTFT breakdown is exported.
 //! * `spec_decode.num_{drafts,draft_tokens,accepted_tokens}_total` — the
 //!   same speculative-decoding fields vLLM feeds, so the frontend renders
 //!   both engines identically.
@@ -194,25 +197,60 @@ struct DgppPrefixCache {
     ttft_miss_ms_avg: Option<f64>,
 }
 
-/// Blend the per-outcome TTFT averages into one mean TTFT (ms), weighted by
-/// observation count. Handles either half being absent (a cache with only
-/// hits or only misses so far) and collapses to `None` when nothing has been
-/// observed yet — the UI renders dashes until then.
-fn blended_ttft_ms(pc: &DgppPrefixCache) -> Option<f64> {
-    match (
-        pc.ttft_hit_count,
-        pc.ttft_hit_ms_avg,
-        pc.ttft_miss_count,
-        pc.ttft_miss_ms_avg,
-    ) {
-        (Some(hn), Some(hm), Some(mn), Some(mm)) => {
-            let total = hn + mn;
-            (total > 0.0).then(|| (hn * hm + mn * mm) / total)
+/// TTFT counter snapshot from the previous poll, per outcome (hit, miss).
+/// The engine exports lifetime (count, average) pairs; both sides are stored
+/// raw so the windowed delta can difference the recovered sums.
+#[derive(Clone, Copy, Default)]
+struct DgppTtftSnapshot {
+    hit_count: Option<f64>,
+    hit_ms_avg: Option<f64>,
+    miss_count: Option<f64>,
+    miss_ms_avg: Option<f64>,
+}
+
+/// Windowed mean TTFT (ms): per-outcome deltas of the lifetime TTFT counters.
+/// DGPP exports lifetime (count, average) per outcome; the product recovers
+/// the lifetime sum, so differencing pairs across polls yields the same
+/// Δsum/Δcount the vLLM card gets from its native histograms (exact up to
+/// the exporter's 3-decimal average rounding). Returns `None` — a blank
+/// tile — when the poll saw no new TTFT observations (idle engine, matching
+/// the vLLM card), when a counter went backwards (engine restart; the next
+/// poll re-baselines), or before the second poll after attach.
+fn windowed_ttft_ms(pc: &DgppPrefixCache, prev: DgppTtftSnapshot) -> Option<f64> {
+    /// One outcome's (Δcount, Δms), or `None` when that outcome's counters
+    /// went backwards. An outcome that is not exported (or not yet
+    /// observed) contributes a zero delta rather than voiding the window.
+    fn outcome_delta(
+        cur: (Option<f64>, Option<f64>),
+        prev: (Option<f64>, Option<f64>),
+    ) -> Option<(f64, f64)> {
+        let (Some(cn), Some(ca)) = cur else {
+            return Some((0.0, 0.0));
+        };
+        if cn < 0.0 || ca < 0.0 {
+            return None;
         }
-        (Some(hn), Some(hm), None, None) if hn > 0.0 => Some(hm),
-        (None, None, Some(mn), Some(mm)) if mn > 0.0 => Some(mm),
-        _ => None,
+        let sum = cn * ca;
+        match (prev.0, prev.1) {
+            (Some(pn), Some(pa)) if pn >= 0.0 && pa >= 0.0 => {
+                let psum = pn * pa;
+                (cn >= pn && sum >= psum).then_some((cn - pn, sum - psum))
+            }
+            (None, None) => Some((0.0, 0.0)), // first poll for this outcome
+            _ => None,                        // inconsistent snapshot → void
+        }
     }
+
+    let (hn, hm) = outcome_delta(
+        (pc.ttft_hit_count, pc.ttft_hit_ms_avg),
+        (prev.hit_count, prev.hit_ms_avg),
+    )?;
+    let (mn, mm) = outcome_delta(
+        (pc.ttft_miss_count, pc.ttft_miss_ms_avg),
+        (prev.miss_count, prev.miss_ms_avg),
+    )?;
+    let total = hn + mn;
+    (total > 0.0).then(|| (hm + mm) / total)
 }
 
 /// Fallback mean TTFT (ms) for engines that do not expose the per-outcome
@@ -238,7 +276,8 @@ struct DgppCounterSnapshot {
 }
 
 /// Everything derived across polls: previous counter readings, running
-/// averages, and the previous spec-decode pair for the live acceptance rate.
+/// averages, the previous spec-decode pair for the live acceptance rate, and
+/// the previous TTFT counts for the windowed TTFT.
 #[derive(Default)]
 struct DgppPollState {
     prev_counters: Option<DgppCounterSnapshot>,
@@ -248,6 +287,8 @@ struct DgppPollState {
     avg_prompt_accum: (f64, u64),
     /// Previous (accepted, draft) spec-decode counters for the live TAR.
     prev_spec: Option<(f64, f64)>,
+    /// Previous TTFT observation counters for the windowed TTFT.
+    prev_ttft: DgppTtftSnapshot,
 }
 
 /// Warmup gate: blanks averaged/derived metrics until the engine has served
@@ -296,6 +337,7 @@ fn compute_metrics(
         state.avg_gen_accum = (0.0, 0);
         state.avg_prompt_accum = (0.0, 0);
         state.prev_spec = None;
+        state.prev_ttft = DgppTtftSnapshot::default();
     }
 
     let scheduler = &body.scheduler;
@@ -472,14 +514,35 @@ fn compute_metrics(
     // first slow inference does not pollute steady-state numbers; gauges and
     // lifetime counters stay populated so the UI shows live engine state.
     let blank = warming_up;
+
+    // --- TTFT ---
+    // Windowed mean TTFT: the engine exports lifetime hit/miss averages, so
+    // the tile shows the mean over TTFT observations since the previous
+    // poll — blank while idle — matching the vLLM card's histogram-delta
+    // semantics. Engines that do not export the breakdown fall back to
+    // cumulative prefill time over prefilled prompts. The snapshot is
+    // stored every poll (the warmup→active transition resets it) so each
+    // window diffs against the immediately preceding poll.
+    let has_ttft_stats = body.prefix_cache.ttft_hit_count.is_some()
+        || body.prefix_cache.ttft_miss_count.is_some();
+    let ttft_ms = if blank {
+        None
+    } else if has_ttft_stats {
+        windowed_ttft_ms(&body.prefix_cache, state.prev_ttft)
+    } else {
+        fallback_ttft_ms(&body.scheduler)
+    };
+    state.prev_ttft = DgppTtftSnapshot {
+        hit_count: body.prefix_cache.ttft_hit_count,
+        hit_ms_avg: body.prefix_cache.ttft_hit_ms_avg,
+        miss_count: body.prefix_cache.ttft_miss_count,
+        miss_ms_avg: body.prefix_cache.ttft_miss_ms_avg,
+    };
+
     EngineMetrics {
         tokens_per_sec: if blank { None } else { tokens_per_sec },
         avg_tokens_per_sec: if blank { None } else { avg_tokens_per_sec },
-        ttft_ms: if blank {
-            None
-        } else {
-            blended_ttft_ms(&body.prefix_cache).or_else(|| fallback_ttft_ms(&body.scheduler))
-        },
+        ttft_ms,
         active_requests,
         queued_requests,
         kv_cache_percent,
@@ -493,6 +556,11 @@ fn compute_metrics(
         total_generation_tokens,
         tpot_ms: if blank { None } else { tpot_ms },
         per_request_tps: if blank { None } else { per_request_tps },
+        // Batch-size tile: mean decode slots per step — the same avg_slots
+        // the TPOT correction uses (weighted mean of the replays_by_slots
+        // histogram, falling back to decode_rows/decode_steps). Matches the
+        // vLLM tile's mean iteration tokens (requests per engine step).
+        avg_batch_size: if blank { None } else { avg_slots },
         spec_decode_draft_tokens_total,
         spec_decode_accepted_tokens_total,
         spec_decode_drafts_total,
@@ -735,27 +803,61 @@ mod tests {
     }
 
     #[test]
-    fn blended_ttft_weights_both_outcomes() {
+    fn windowed_ttft_weights_both_outcomes() {
         let pc = live_fixture().prefix_cache;
-        let expected = (62.0 * 27672.931 + 105.0 * 137882.263) / 167.0;
-        let got = blended_ttft_ms(&pc).expect("both halves present");
+        let prev = DgppTtftSnapshot {
+            hit_count: Some(60.0),
+            hit_ms_avg: Some(27_672.931),
+            miss_count: Some(103.0),
+            miss_ms_avg: Some(137_882.263),
+        };
+        // 2 new hits and 2 new misses, each entering at its outcome's
+        // current lifetime average (sum differencing with unchanged avg).
+        let expected = (2.0 * 27_672.931 + 2.0 * 137_882.263) / 4.0;
+        let got = windowed_ttft_ms(&pc, prev).expect("new observations");
         assert!((got - expected).abs() < 1e-6, "got {got}, want {expected}");
     }
 
     #[test]
-    fn blended_ttft_handles_one_sided_and_empty_caches() {
-        let mut pc = DgppPrefixCache::default();
-        assert_eq!(blended_ttft_ms(&pc), None, "nothing observed yet");
+    fn windowed_ttft_blank_without_new_observations() {
+        let pc = live_fixture().prefix_cache;
+        // Idle engine: counts unchanged since the previous poll.
+        let idle = DgppTtftSnapshot {
+            hit_count: pc.ttft_hit_count,
+            hit_ms_avg: pc.ttft_hit_ms_avg,
+            miss_count: pc.ttft_miss_count,
+            miss_ms_avg: pc.ttft_miss_ms_avg,
+        };
+        assert_eq!(windowed_ttft_ms(&pc, idle), None, "idle → blank tile");
 
-        pc.ttft_hit_count = Some(3.0);
-        pc.ttft_hit_ms_avg = Some(100.0);
-        assert_eq!(blended_ttft_ms(&pc), Some(100.0), "hits only");
+        // First poll after attach: nothing recorded yet.
+        assert_eq!(windowed_ttft_ms(&pc, DgppTtftSnapshot::default()), None);
 
-        pc.ttft_hit_count = None;
-        pc.ttft_hit_ms_avg = None;
-        pc.ttft_miss_count = Some(7.0);
-        pc.ttft_miss_ms_avg = Some(300.0);
-        assert_eq!(blended_ttft_ms(&pc), Some(300.0), "misses only");
+        // Counters going backwards (engine restart) yield None too.
+        let restarted = DgppTtftSnapshot {
+            hit_count: Some(100.0),
+            hit_ms_avg: Some(1.0),
+            miss_count: Some(200.0),
+            miss_ms_avg: Some(1.0),
+        };
+        assert_eq!(windowed_ttft_ms(&pc, restarted), None);
+    }
+
+    #[test]
+    fn windowed_ttft_one_sided_window() {
+        // Only the miss side advanced: the window mean is that outcome's
+        // current lifetime average.
+        let pc = live_fixture().prefix_cache;
+        let prev = DgppTtftSnapshot {
+            hit_count: pc.ttft_hit_count,
+            hit_ms_avg: pc.ttft_hit_ms_avg,
+            miss_count: Some(105.0 - 2.0),
+            miss_ms_avg: pc.ttft_miss_ms_avg,
+        };
+        // Delta sum carries ~1e-9 relative float error from count×avg
+        // products, so compare with tolerance.
+        let got = windowed_ttft_ms(&pc, prev).expect("miss-only window");
+        assert!((got - 137_882.263).abs() < 1e-6, "got {got}");
     }
 
     #[test]
@@ -774,11 +876,34 @@ mod tests {
     }
 
     #[test]
-    fn blended_ttft_takes_precedence_over_fallback() {
+    fn ttft_is_windowed_across_polls() {
         let body = live_fixture();
-        let blended = blended_ttft_ms(&body.prefix_cache).expect("hit/miss present");
-        let fallback = fallback_ttft_ms(&body.scheduler).expect("totals present");
-        assert!(blended != fallback, "the hit/miss blend wins when present");
+        let t0 = Instant::now();
+        let mut state = DgppPollState::default();
+        let first = compute_metrics(&body, &mut state, false, false, t0);
+        assert_eq!(first.ttft_ms, None, "first poll has no window");
+
+        // One more hit and one more miss one poll later: the window mean is
+        // the pair of current lifetime averages.
+        let mut grown = live_fixture();
+        grown.prefix_cache.ttft_hit_count = Some(63.0);
+        grown.prefix_cache.ttft_miss_count = Some(106.0);
+        let m = compute_metrics(&grown, &mut state, false, false, t0 + Duration::from_secs(2));
+        let expected = (27_672.931 + 137_882.263) / 2.0;
+        let got = m.ttft_ms.expect("windowed ttft");
+        assert!((got - expected).abs() < 1e-6, "got {got}, want {expected}");
+    }
+
+    #[test]
+    fn ttft_falls_back_to_prefill_totals_without_ttft_stats() {
+        let mut body = live_fixture();
+        body.prefix_cache.ttft_hit_count = None;
+        body.prefix_cache.ttft_hit_ms_avg = None;
+        body.prefix_cache.ttft_miss_count = None;
+        body.prefix_cache.ttft_miss_ms_avg = None;
+        let mut state = DgppPollState::default();
+        let m = compute_metrics(&body, &mut state, false, false, Instant::now());
+        assert_eq!(m.ttft_ms, fallback_ttft_ms(&body.scheduler));
     }
 
     #[test]
@@ -847,6 +972,9 @@ mod tests {
         let pr = m.per_request_tps.expect("per-request tps");
         assert!((pr - 411_677.0 * 1000.0 / (12_946_059.9 * slots)).abs() < 1e-6);
 
+        // Batch-size tile shares avg_slots with the TPOT correction.
+        assert!((m.avg_batch_size.expect("batch size") - slots).abs() < 1e-9);
+
         // Spec-decode lifetime ratios.
         let tar = m.spec_decode_acceptance_rate.expect("tar");
         assert!((tar - 179836.0 / 231747.0 * 100.0).abs() < 1e-6);
@@ -856,6 +984,8 @@ mod tests {
         assert_eq!(m.tokens_per_sec, None);
         assert_eq!(m.prompt_tokens_per_sec, None);
         assert_eq!(m.spec_decode_acceptance_rate_live, None);
+        // TTFT is windowed, so the first poll has no window either.
+        assert_eq!(m.ttft_ms, None);
         // E2E latency has no DGPP source.
         assert_eq!(m.e2e_latency_ms, None);
         assert!(m.ttft_percentiles.is_none());
@@ -885,6 +1015,9 @@ mod tests {
         // Averages accumulated the non-zero readings.
         assert!((m.avg_tokens_per_sec.unwrap() - 1000.0).abs() < 1e-6);
         assert!((m.avg_prompt_tokens_per_sec.unwrap() - 10000.0).abs() < 1e-6);
+        // The grown fixture adds no TTFT observations: the tile blanks
+        // rather than showing the lifetime average.
+        assert_eq!(m.ttft_ms, None);
     }
 
     #[test]
@@ -899,6 +1032,8 @@ mod tests {
         assert_eq!(m.tpot_ms, None);
         assert_eq!(m.per_request_tps, None);
         assert_eq!(m.spec_decode_acceptance_rate_live, None);
+        assert_eq!(m.ttft_ms, None);
+        assert_eq!(m.avg_batch_size, None);
         // Gauges and lifetime counters stay live during warmup.
         assert_eq!(m.active_requests, Some(2));
         assert_eq!(m.total_generation_tokens, Some(411_677));
@@ -921,6 +1056,7 @@ mod tests {
         assert_eq!(m.tokens_per_sec, None, "no rate across the boundary");
         let fresh = state.prev_counters.expect("fresh baseline recorded");
         assert_eq!(fresh.tokens_generated, 411_677.0);
+        assert_eq!(state.prev_ttft.hit_count, Some(62.0), "fresh TTFT baseline");
         assert_eq!(state.avg_gen_accum, (0.0, 0));
         assert!(state.prev_spec.is_some(), "fresh spec pair recorded");
 
