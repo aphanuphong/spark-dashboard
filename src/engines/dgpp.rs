@@ -9,8 +9,10 @@
 //! metrics as follows:
 //!
 //! * `tokens_generated` / `prompt_tokens` — lifetime token counters; the
-//!   per-poll deltas drive instantaneous generation/prompt throughput and
-//!   the engine-side `step_ms` moving average provides TPOT.
+//!   per-poll deltas drive instantaneous generation/prompt throughput, and
+//!   `step_ms` over committed tokens gives true per-token TPOT plus a
+//!   per-request TPS (batch-size corrected via the `decode_batch` slot
+//!   histogram — see `avg_slots_from_histogram`).
 //! * `pool_blocks_in_use` / `pool_blocks_total` — KV-cache pool utilization.
 //! * `prefix_cache.hits` / `misses` — prefix-cache hit rate; the paired
 //!   `ttft_hit_*` / `ttft_miss_*` averages blend into an overall mean TTFT.
@@ -26,6 +28,7 @@
 use super::metadata::ModelMetadata;
 use super::{EngineAdapter, EngineMetrics, EngineStatus, EngineType, ModelResolution};
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 use serde::Deserialize;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -68,6 +71,23 @@ fn spec_mean_acceptance_length(accepted: Option<f64>, drafts: Option<f64>) -> Op
     }
 }
 
+/// Lifetime weighted-average decode batch size (requests per step) from the
+/// engine's `decode_batch.replays_by_slots` histogram: Σ(slots × replays) /
+/// Σreplays. `None` while nothing has been decoded or when the histogram is
+/// absent (older DGPP), so callers can fall back to a coarser shape.
+fn avg_slots_from_histogram(batch: Option<&DgppDecodeBatch>) -> Option<f64> {
+    let map = batch?.replays_by_slots.as_ref()?;
+    let mut weighted = 0.0f64;
+    let mut total = 0.0f64;
+    for (slots, count) in map {
+        let Ok(slots) = slots.parse::<f64>() else { continue };
+        let count = count.max(0.0);
+        weighted += slots * count;
+        total += count;
+    }
+    (total > 0.0).then_some(weighted / total)
+}
+
 // ---------------------------------------------------------------------------
 // GET /metrics response shape
 // ---------------------------------------------------------------------------
@@ -102,14 +122,21 @@ struct DgppScheduler {
     /// Lifetime decode iteration steps.
     #[serde(default)]
     decode_steps: Option<f64>,
+    /// Lifetime decode token rows scheduled (draft attempts included).
+    #[serde(default)]
+    decode_rows: Option<f64>,
     /// Cumulative prefill time (ms). With `prompts_prefilled`, this is the
     /// fallback mean-TTFT source when the hit/miss breakdown is absent.
     #[serde(default)]
     prefill_ms: Option<f64>,
     /// Cumulative decode step time (ms) — the engine's own moving-average
-    /// source for TPOT (`step_ms` / `decode_steps`).
+    /// time base for per-token TPOT and per-request TPS (batch-size
+    /// corrected; see `avg_slots` in `compute_metrics`).
     #[serde(default)]
     step_ms: Option<f64>,
+    /// Batch-size facts for per-request views; absent on older DGPP.
+    #[serde(default)]
+    decode_batch: Option<DgppDecodeBatch>,
     /// KV-cache pool blocks: total capacity and currently in use.
     #[serde(default)]
     pool_blocks_total: Option<f64>,
@@ -118,6 +145,15 @@ struct DgppScheduler {
     /// Speculative decoding counters; absent when spec decode is off.
     #[serde(default)]
     spec_decode: Option<DgppSpecDecode>,
+}
+
+/// `scheduler.decode_batch`: per-step batch-size facts. Only the lifetime
+/// `replays_by_slots` histogram is consumed (keys are slot counts as
+/// strings, values are replay counts); everything else is ignored.
+#[derive(Deserialize, Default)]
+struct DgppDecodeBatch {
+    #[serde(default)]
+    replays_by_slots: Option<BTreeMap<String, f64>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -310,11 +346,51 @@ fn compute_metrics(
     let avg_prompt_tokens_per_sec =
         (state.avg_prompt_accum.1 > 0).then(|| state.avg_prompt_accum.0 / state.avg_prompt_accum.1 as f64);
 
-    // TPOT: the engine's own cumulative step-time average. decode_rows counts
-    // scheduled token rows (draft attempts included), so decode_steps — one
-    // verification pass per step — is the honest denominator.
-    let tpot_ms = match (scheduler.step_ms, scheduler.decode_steps) {
-        (Some(ms), Some(steps)) if steps > 0.0 && ms > 0.0 => Some(ms / steps),
+    // Batch-size correction for per-request views. `step_ms`/`decode_steps`
+    // is time per decode *step*; with MTP each step commits ~1 sampled token
+    // per request plus accepted drafts, and `tokens_generated` counts every
+    // committed token across the whole batch — so per-token (and
+    // per-request) views divide by the batch size, which the engine exposes
+    // as the lifetime `replays_by_slots` histogram. The weighted mean over
+    // that histogram matches the engine's own per-request ms/tok (validated
+    // against serve-log retire lines); without the histogram fall back to
+    // decode_rows/decode_steps (lifetime mean batch rows), which is exact
+    // when slots never change but overweights multi-slot steps otherwise.
+    let avg_slots = avg_slots_from_histogram(scheduler.decode_batch.as_ref()).or_else(|| {
+        match (scheduler.decode_rows, scheduler.decode_steps) {
+            (Some(rows), Some(steps)) if steps > 0.0 => Some(rows / steps),
+            _ => None,
+        }
+    });
+
+    // True per-token time: total decode ms over total committed tokens,
+    // scaled by the mean batch size (ms/token = step_ms × slots / tokens).
+    // Falls back to the engine's raw per-step average when no batch size is
+    // derivable, which is exact with speculative decoding off but overstates
+    // TPOT under MTP.
+    let tpot_ms = match (scheduler.step_ms, scheduler.tokens_generated, avg_slots) {
+        (Some(ms), Some(tokens), Some(slots))
+            if ms > 0.0 && tokens > 0.0 && slots > 0.0 =>
+        {
+            Some(ms * slots / tokens)
+        }
+        (Some(ms), _, None) => scheduler
+            .decode_steps
+            .filter(|&steps| steps > 0.0 && ms > 0.0)
+            .map(|steps| ms / steps),
+        _ => None,
+    };
+
+    // Per-request decode throughput: committed tokens per second of decode
+    // time per batch slot — the same "one request's view" quantity the vLLM
+    // adapter derives from its TPOT histogram (validated against the
+    // engine's per-request retire lines).
+    let per_request_tps = match (scheduler.tokens_generated, scheduler.step_ms, avg_slots) {
+        (Some(tokens), Some(ms), Some(slots))
+            if tokens > 0.0 && ms > 0.0 && slots > 0.0 =>
+        {
+            Some(tokens * 1000.0 / (ms * slots))
+        }
         _ => None,
     };
 
@@ -416,6 +492,7 @@ fn compute_metrics(
         total_prompt_tokens,
         total_generation_tokens,
         tpot_ms: if blank { None } else { tpot_ms },
+        per_request_tps: if blank { None } else { per_request_tps },
         spec_decode_draft_tokens_total,
         spec_decode_accepted_tokens_total,
         spec_decode_drafts_total,
@@ -574,6 +651,25 @@ impl DgppAdapter {
 mod tests {
     use super::*;
 
+    #[test]
+    fn avg_slots_weighted_mean_over_histogram() {
+        let mut batch = DgppDecodeBatch::default();
+        batch.replays_by_slots = Some(
+            [
+                ("1".to_string(), 100.0),
+                ("4".to_string(), 100.0),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        // (1×100 + 4×100) / 200 = 2.5.
+        assert_eq!(avg_slots_from_histogram(Some(&batch)), Some(2.5));
+
+        batch.replays_by_slots = Some([("1".to_string(), 0.0)].into_iter().collect());
+        assert_eq!(avg_slots_from_histogram(Some(&batch)), None, "empty histogram");
+        assert_eq!(avg_slots_from_histogram(None), None, "absent decode_batch");
+    }
+
     /// A fixture mirroring the live `dgpp-serve` `/metrics` shape (values
     /// from a real poll). Deserialization must tolerate the full document,
     /// including fields the adapter ignores.
@@ -588,7 +684,8 @@ mod tests {
                 "prompts_prefilled": 167, "prompt_tokens": 4563370,
                 "prompt_tokens_computed": 1671594, "decode_steps": 221417,
                 "decode_rows": 231747,
-                "decode_batch": {"last_slots": 1, "replays": 221417},
+                "decode_batch": {"last_slots": 1, "replays": 221417,
+                  "replays_by_slots": {"1": 220617, "2": 800}},
                 "spec_decode": {
                   "depth": 1, "num_drafts_total": 231747,
                   "num_draft_tokens_total": 231747,
@@ -736,9 +833,19 @@ mod tests {
         let hit = m.prefix_cache_hit_rate.expect("hit rate");
         assert!((hit - 62.0 / 167.0 * 100.0).abs() < 1e-9);
 
-        // TPOT from the engine's cumulative average: 12946059.9 / 221417.
+        // TPOT is batch-corrected: step_ms × avg_slots / tokens_generated,
+        // with avg_slots the weighted mean of the replays_by_slots histogram
+        // (222217 / 221417 here) — ms per committed token, matching the
+        // engine's own per-request ms/tok.
+        let slots = (220_617.0 + 2.0 * 800.0) / (220_617.0 + 800.0);
         let tpot = m.tpot_ms.expect("tpot");
-        assert!((tpot - 12946059.9 / 221417.0).abs() < 1e-6);
+        assert!((tpot - 12_946_059.9 * slots / 411_677.0).abs() < 1e-6);
+
+        // Per-request TPS is the reciprocal view (committed tokens per decode
+        // second per batch slot). Lifetime-derived, so it is available on the
+        // first poll — unlike the window-delta rates below.
+        let pr = m.per_request_tps.expect("per-request tps");
+        assert!((pr - 411_677.0 * 1000.0 / (12_946_059.9 * slots)).abs() < 1e-6);
 
         // Spec-decode lifetime ratios.
         let tar = m.spec_decode_acceptance_rate.expect("tar");
@@ -790,6 +897,7 @@ mod tests {
         assert_eq!(m.tokens_per_sec, None);
         assert_eq!(m.avg_tokens_per_sec, None);
         assert_eq!(m.tpot_ms, None);
+        assert_eq!(m.per_request_tps, None);
         assert_eq!(m.spec_decode_acceptance_rate_live, None);
         // Gauges and lifetime counters stay live during warmup.
         assert_eq!(m.active_requests, Some(2));
