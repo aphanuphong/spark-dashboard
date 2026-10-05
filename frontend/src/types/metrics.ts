@@ -93,7 +93,7 @@ export interface NetworkMetrics {
 
 // --- LLM Engine Types (Phase 2) ---
 
-export type EngineType = 'Vllm'
+export type EngineType = 'Vllm' | 'Dgpp' | 'Auto'
 
 export type DeploymentMode = 'Docker' | 'Native'
 

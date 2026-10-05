@@ -166,6 +166,10 @@ export function formatGpuIndexes(indexes: number[]): string {
 export function engineDisplayName(engineType: EngineType): string {
   const names: Record<EngineType, string> = {
     Vllm: 'vLLM',
+    Dgpp: 'DGPP',
+    // A manual `auto` override that has not yet sniffed the engine live at
+    // its endpoint. Once it does, the snapshot reports the detected flavor.
+    Auto: 'Auto-detect',
   }
   return names[engineType]
 }
